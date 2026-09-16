@@ -5,9 +5,8 @@ import json
 import os
 from pathlib import Path
 import shutil
-import subprocess
 
-from .common import ARTIFACTS, MODEL_ID, RESULTS, ROOT, clean_env, ensure_dirs, run, write_json
+from .common import ARTIFACTS, MODEL_ID, RESULTS, ROOT, clean_env, ensure_dirs, run
 from .setup_env import env_python
 
 
@@ -21,6 +20,16 @@ def prepare_data() -> Path:
     if not p.exists():
         raise RuntimeError(f"dataset missing: {p}")
     return p
+
+
+def prepare_hessians() -> Path:
+    explicit = os.environ.get("VPTQ_HESSIAN_DIR")
+    if explicit:
+        return Path(explicit).resolve()
+    invoke_env("scripts.prepare_hessians")
+    path = ARTIFACTS / "hessians_llama2_7b_fingerprinted"
+    os.environ["VPTQ_HESSIAN_DIR"] = str(path)
+    return path
 
 
 def run_inference(condition: str, model: str, backend: str, dataset: Path, force: bool = False) -> Path:
@@ -51,6 +60,7 @@ def score(condition: str, jsonl: Path) -> dict:
 
 
 def quantize(bits: int) -> Path:
+    prepare_hessians()
     invoke_env("scripts.quantize_vptq", str(bits))
     manifest = ARTIFACTS / f"vptq_{bits}bit" / "manifest.json"
     if not manifest.exists():
@@ -82,20 +92,24 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--setup-only", action="store_true")
     p.add_argument("--baseline-only", action="store_true")
+    p.add_argument("--hessian-only", action="store_true")
     p.add_argument("--quant-only", type=int, choices=[3, 4])
     p.add_argument("--eval-only", action="store_true")
-    p.add_argument("--fsr-only", action="store_true", help="kept for parity; skips nothing except optional PPL reporting")
+    p.add_argument("--fsr-only", action="store_true", help="run FSR pipeline; VPTQ upstream still performs its built-in PPL because run_vptq.py requires an eval mode")
     p.add_argument("--force", action="store_true")
     a = p.parse_args()
     ensure_dirs()
 
-    # Setup always runs first; it is idempotent and verifies system Torch is untouched.
     run([os.environ.get("IF_SFT_SYSTEM_PYTHON", os.sys.executable), "-m", "scripts.setup_env"], cwd=ROOT, env=clean_env())
     if a.setup_only:
         return
 
     dataset = prepare_data()
     force = a.force or os.environ.get("FORCE") == "1"
+
+    if a.hessian_only:
+        prepare_hessians()
+        return
 
     if a.quant_only:
         quantize(a.quant_only)
