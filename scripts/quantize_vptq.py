@@ -9,10 +9,6 @@ import time
 from .common import ARTIFACTS, MODEL_ID, UPSTREAM, clean_env, run, write_json
 from .setup_env import env_python
 
-# 3-bit follows Microsoft's algorithm tutorial (v8-k65536-256).
-# 4-bit follows the VPTQ-community reproduced Llama-2 baseline
-# (Llama-2-7b-hf-v6-k4096-4096): 12/6 + 12/6 = 4 index bits/weight.
-# This 4-bit setting is also dramatically cheaper to k-means than 65536+65536.
 CONFIGS = {
     3: {"vector_len": 8, "num_centroids": 65536, "num_res_centroids": 256, "config_origin": "microsoft/VPTQ algorithm tutorial"},
     4: {"vector_len": 6, "num_centroids": 4096, "num_res_centroids": 4096, "config_origin": "VPTQ-community reproduced Llama-2 baseline"},
@@ -30,7 +26,7 @@ def newest_dir(root: Path, before: set[Path]) -> Path:
     return created[-1]
 
 
-def validate_hessian_dir(path: Path) -> None:
+def validate_hessian_dir(path: Path, *, inspect_contents: bool = False) -> None:
     if not path.is_dir():
         raise RuntimeError(f"Hessian directory not found: {path}")
     expected = []
@@ -41,6 +37,33 @@ def validate_hessian_dir(path: Path) -> None:
     if missing:
         raise RuntimeError(f"Hessian directory is incomplete ({len(missing)} missing); first: {missing[:8]}")
 
+    if inspect_contents:
+        # VPTQ vptq/utils/hessian.py requires exactly flatH, mu and n. The earlier
+        # QTIP collector did not write mu, so inspect representative files before a
+        # multi-hour VPTQ run. One layer covers every projection input dimension.
+        import torch
+
+        expected_n = {"qkv": 4096, "o": 4096, "up": 4096, "down": 11008}
+        for suffix, n_expected in expected_n.items():
+            sample = path / f"0_{suffix}.pt"
+            data = torch.load(sample, map_location="cpu", weights_only=False)
+            required = {"flatH", "mu", "n"}
+            absent = sorted(required - set(data))
+            if absent:
+                raise RuntimeError(f"Incompatible Hessian {sample}: missing VPTQ fields {absent}")
+            n = int(data["n"])
+            if n != n_expected:
+                raise RuntimeError(f"Incompatible Hessian {sample}: n={n}, expected {n_expected} for Llama-2-7B")
+            if tuple(data["mu"].shape) != (n,):
+                raise RuntimeError(f"Incompatible Hessian {sample}: mu shape={tuple(data['mu'].shape)}, expected {(n,)}")
+            expected_flat = n * (n + 1) // 2
+            if data["flatH"].numel() != expected_flat:
+                raise RuntimeError(
+                    f"Incompatible Hessian {sample}: flatH has {data['flatH'].numel()} values, expected {expected_flat}"
+                )
+            del data
+        print("[HESSIAN] format check OK: flatH + mu + n and Llama-2-7B dimensions")
+
 
 def quantize(bits: int, *, kiter: int = 100, ktol: float = 1e-5, seq_len: int = 4096) -> Path:
     if bits not in CONFIGS:
@@ -49,7 +72,7 @@ def quantize(bits: int, *, kiter: int = 100, ktol: float = 1e-5, seq_len: int = 
     if not hessian:
         raise RuntimeError("Set VPTQ_HESSIAN_DIR to LLaMA-2-7B-compatible upstream-format Hessians")
     hessian_path = Path(hessian).resolve()
-    validate_hessian_dir(hessian_path)
+    validate_hessian_dir(hessian_path, inspect_contents=True)
     inv = os.environ.get("VPTQ_INV_HESSIAN_DIR")
     inv_path = Path(inv).resolve() if inv else None
     if inv_path is not None:
@@ -89,12 +112,8 @@ def quantize(bits: int, *, kiter: int = 100, ktol: float = 1e-5, seq_len: int = 
         "--ktol", str(ktol),
         "--kiter", str(kiter),
     ]
-    # Upstream's algorithm tutorial currently warns enable_perm/enable_norm are
-    # missing/not tested, so the reproducible default deliberately leaves them off.
     if inv_path is not None:
         cmd.extend(["--inv_hessian_path", str(inv_path)])
-    # run_vptq.py's released control flow expects an eval mode after quantization;
-    # --new_eval also gives useful WikiText-2/C4-new PPL for the actual packed model.
     cmd.append("--new_eval")
 
     env = clean_env()
