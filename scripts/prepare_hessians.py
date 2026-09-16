@@ -29,6 +29,8 @@ def main() -> Path:
     script = qtip / "quantize_llama" / "input_hessian_llama.py"
     if not script.exists():
         raise RuntimeError("Pinned QTIP Hessian collector missing")
+    if not (qtip / "lib").is_dir():
+        raise RuntimeError("Pinned QTIP lib/ package missing")
 
     # Colab-practical defaults. Set HESSIAN_DEVSET_SIZE=8192 to reproduce the
     # upstream collector's original full default; 512 is much faster for attack screening.
@@ -40,6 +42,16 @@ def main() -> Path:
 
     env = clean_env()
     env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+
+    # QTIP's upstream input_hessian_llama.py imports `from lib import utils`.
+    # When torchrun executes the script by absolute path, Python puts
+    # qtip/quantize_llama (not the qtip repository root) on sys.path, so `lib`
+    # is otherwise invisible. Preserve the upstream script unchanged and expose
+    # its repository root through PYTHONPATH instead of patching QTIP code.
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(qtip) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    print(f"[HESSIAN] PYTHONPATH={env['PYTHONPATH']}")
+
     # torchrun initializes the single-GPU NCCL process group expected by upstream.
     cmd = [
         env_python(), "-m", "torch.distributed.run", "--nproc_per_node=1",
