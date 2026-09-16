@@ -6,12 +6,16 @@ import os
 from pathlib import Path
 import time
 
-from .common import ARTIFACTS, MODEL_ID, ROOT, UPSTREAM, clean_env, run, write_json
+from .common import ARTIFACTS, MODEL_ID, UPSTREAM, clean_env, run, write_json
 from .setup_env import env_python
 
+# 3-bit follows Microsoft's algorithm tutorial (v8-k65536-256).
+# 4-bit follows the VPTQ-community reproduced Llama-2 baseline
+# (Llama-2-7b-hf-v6-k4096-4096): 12/6 + 12/6 = 4 index bits/weight.
+# This 4-bit setting is also dramatically cheaper to k-means than 65536+65536.
 CONFIGS = {
-    3: {"vector_len": 8, "num_centroids": 65536, "num_res_centroids": 256},
-    4: {"vector_len": 8, "num_centroids": 65536, "num_res_centroids": 65536},
+    3: {"vector_len": 8, "num_centroids": 65536, "num_res_centroids": 256, "config_origin": "microsoft/VPTQ algorithm tutorial"},
+    4: {"vector_len": 6, "num_centroids": 4096, "num_res_centroids": 4096, "config_origin": "VPTQ-community reproduced Llama-2 baseline"},
 }
 
 
@@ -19,7 +23,6 @@ def newest_dir(root: Path, before: set[Path]) -> Path:
     after = {p for p in root.iterdir() if p.is_dir()} if root.exists() else set()
     created = sorted(after - before, key=lambda p: p.stat().st_mtime)
     if not created:
-        # Resume-friendly fallback: upstream timestamp dir may already exist.
         existing = sorted(after, key=lambda p: p.stat().st_mtime)
         if not existing:
             raise RuntimeError(f"No VPTQ output directory found under {root}")
@@ -30,7 +33,6 @@ def newest_dir(root: Path, before: set[Path]) -> Path:
 def validate_hessian_dir(path: Path) -> None:
     if not path.is_dir():
         raise RuntimeError(f"Hessian directory not found: {path}")
-    # LLaMA-2-7B has 32 layers. VPTQ shares q/k/v -> qkv and gate/up -> up.
     expected = []
     for layer in range(32):
         for suffix in ("qkv", "o", "up", "down"):
@@ -60,9 +62,12 @@ def quantize(bits: int, *, kiter: int = 100, ktol: float = 1e-5, seq_len: int = 
     if manifest.exists() and not os.environ.get("FORCE"):
         state = json.loads(manifest.read_text(encoding="utf-8"))
         packed = Path(state["packed_model"])
-        if packed.exists():
-            print(f"[SKIP] verified manifest exists for VPTQ {bits}-bit: {packed}")
+        expected_cfg = {k: cfg[k] for k in ("vector_len", "num_centroids", "num_res_centroids")}
+        actual_cfg = {k: state.get(k) for k in expected_cfg}
+        if packed.exists() and actual_cfg == expected_cfg:
+            print(f"[SKIP] matching VPTQ {bits}-bit artifact exists: {packed}")
             return packed
+        print("[RERUN] manifest exists but quantization config changed")
 
     before = {p for p in base.iterdir() if p.is_dir()}
     cmd = [
@@ -84,12 +89,13 @@ def quantize(bits: int, *, kiter: int = 100, ktol: float = 1e-5, seq_len: int = 
         "--ktol", str(ktol),
         "--kiter", str(kiter),
     ]
-    # enable_perm/enable_norm are present in the tutorial but upstream explicitly marks
-    # them as missing/not tested. Do not add them silently for the final reproducible path.
+    # Upstream's algorithm tutorial currently warns enable_perm/enable_norm are
+    # missing/not tested, so the reproducible default deliberately leaves them off.
     if inv_path is not None:
         cmd.extend(["--inv_hessian_path", str(inv_path)])
-    if os.environ.get("VPTQ_RUN_PPL", "1") == "1":
-        cmd.append("--new_eval")
+    # run_vptq.py's released control flow expects an eval mode after quantization;
+    # --new_eval also gives useful WikiText-2/C4-new PPL for the actual packed model.
+    cmd.append("--new_eval")
 
     env = clean_env()
     env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
