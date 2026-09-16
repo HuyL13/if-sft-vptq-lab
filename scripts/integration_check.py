@@ -1,18 +1,12 @@
 from __future__ import annotations
 
-import ast
-import importlib
-import json
 import os
 from pathlib import Path
 import py_compile
 import subprocess
 import sys
-import tempfile
 
-from .common import (
-    MODEL_ID, ROOT, UPSTREAM, VPTQ_REF, MF_REF, QUIP_REF, output, clean_env
-)
+from .common import ROOT, UPSTREAM, VPTQ_REF, MF_REF, QUIP_REF, output, clean_env
 from .prepare_hessians import build_runtime_collector
 from .quantize_vptq import CONFIGS
 
@@ -44,6 +38,7 @@ def check_pins() -> None:
 
 
 def check_runtime_imports() -> None:
+    import numpy as np
     import torch
     import transformers
     import datasets
@@ -57,8 +52,19 @@ def check_runtime_imports() -> None:
 
     require(torch.cuda.is_available(), "CUDA visible to system Torch")
     require(get_conversation_template("vicuna") is not None, "FastChat Vicuna template")
-    require(KMeans is not None, "cuML KMeans import")
     require(_prepare_4d_causal_attention_mask is not None, "Transformers causal-mask helper used by QuIP#")
+
+    # Exercise the same cuML call shape used by VPTQ, not merely the import.
+    X = np.asarray([[0.0, 0.0], [0.1, 0.2], [4.0, 4.0], [4.2, 4.1]], dtype=np.float32)
+    w = torch.ones(4, device="cuda", dtype=torch.float32)
+    km = KMeans(n_clusters=2, tol=1e-5, init="random", max_iter=3, random_state=0, n_init=1)
+    with cupy.cuda.Device(w.device.index):
+        km.fit(X, sample_weight=w)
+    centers = km.cluster_centers_
+    labels = km.labels_
+    require(hasattr(centers, "shape") and tuple(centers.shape) == (2, 2), "cuML KMeans.fit with Torch CUDA sample_weight")
+    require(len(labels) == 4, "cuML KMeans labels API used by VPTQ")
+
     print(
         f"[INTEGRATION] python={sys.executable} torch={torch.__version__} "
         f"cuda={torch.version.cuda} transformers={transformers.__version__} "
@@ -93,8 +99,6 @@ def check_quip_hessian_contract() -> None:
     rt = runtime.read_text(encoding="utf-8")
     require("from scripts import quip_hessian_utils as utils" in rt, "runtime collector imports minimal QuIP# shim")
 
-    # `--help` exercises all top-level collector imports/parser creation without
-    # loading a 7B model or allocating Hessians.
     env = clean_env()
     old_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + old_pp if old_pp else "")
@@ -102,7 +106,6 @@ def check_quip_hessian_contract() -> None:
                    stdout=subprocess.DEVNULL, check=True)
     ok("QuIP# runtime collector top-level imports and CLI parse")
 
-    # Unit-test the shim's key contract on a tiny Linear layer, including mu.
     import torch
     from . import quip_hessian_utils as u
     layer = torch.nn.Linear(3, 2, bias=False).cuda()
@@ -113,27 +116,49 @@ def check_quip_hessian_contract() -> None:
     require(ct == 2, "QuIP# shim hook sample count")
     require(tuple(H.shape) == (3, 3) and tuple(mu.shape) == (3,), "QuIP# shim H/mu shapes")
     require(torch.allclose(mu, x.double().sum(dim=0).cpu()), "QuIP# shim mean accumulator")
+    require(torch.allclose(H, (x.double().T @ x.double()).cpu()), "QuIP# shim second-moment accumulator")
 
 
 def check_vptq_cli() -> None:
-    # HfArgumentParser accepts the exact argument names/list arity we will use.
-    cmd = [sys.executable, "run_vptq.py", "--help"]
-    subprocess.run(cmd, cwd=UPSTREAM / "VPTQ", env=clean_env(),
+    subprocess.run([sys.executable, "run_vptq.py", "--help"], cwd=UPSTREAM / "VPTQ", env=clean_env(),
                    stdout=subprocess.DEVNULL, check=True)
     ok("VPTQ run_vptq.py top-level imports and CLI parser")
+
+    # Parse the exact list-valued arguments used by our launcher without entering
+    # VPTQ's expensive model-loading main path.
+    code = r'''
+from transformers import HfArgumentParser
+from run_vptq import VPTQArguments
+from vptq.quantizer import QuantizationArguments
+for vlen, kc, kr in [(6,4096,4096),(8,65536,256)]:
+    parser=HfArgumentParser((VPTQArguments, QuantizationArguments))
+    a,q=parser.parse_args_into_dataclasses(args=[
+      '--model_name','cnut1648/LLaMA2-7B-fingerprinted-SFT',
+      '--vector_lens','-1',str(vlen),'--group_num','1',
+      '--num_centroids','-1',str(kc),'--num_res_centroids','-1',str(kr),
+      '--npercent','0','--blocksize','128','--seq_len','4096',
+      '--kmeans_mode','hessian','--num_gpus','1','--save_model',
+      '--save_packed_model','--hessian_path','/tmp/h','--ktol','1e-5',
+      '--kiter','100','--new_eval'])
+    assert q.vector_lens == [-1,vlen]
+    assert q.num_centroids == [-1,kc]
+    assert q.num_res_centroids == [-1,kr]
+print('ok')
+'''
+    subprocess.run([sys.executable, "-c", code], cwd=UPSTREAM / "VPTQ", env=clean_env(),
+                   stdout=subprocess.DEVNULL, check=True)
+    ok("exact VPTQ 3-bit/4-bit launcher arguments parse")
+
     for bits, cfg in CONFIGS.items():
         require(cfg["vector_len"] > 0 and cfg["num_centroids"] > 0 and cfg["num_res_centroids"] > 0,
                 f"VPTQ {bits}-bit config values")
 
 
 def check_if_sft_contract() -> None:
-    create = UPSTREAM / "Model-Fingerprint" / "fingerprint" / "create_fingerprint_chat.py"
-    # Upstream path differs slightly across snapshots; locate by exact basename if needed.
-    if not create.exists():
-        matches = list((UPSTREAM / "Model-Fingerprint").rglob("create_fingerprint_chat.py"))
-        require(len(matches) == 1, "locate official IF-SFT create_fingerprint_chat.py")
-        create = matches[0]
-    report_matches = list((UPSTREAM / "Model-Fingerprint").rglob("report_FSR_sft_chat.py"))
+    root = UPSTREAM / "Model-Fingerprint"
+    create_matches = list(root.rglob("create_fingerprint_chat.py"))
+    require(len(create_matches) == 1, "locate official IF-SFT create_fingerprint_chat.py")
+    report_matches = list(root.rglob("report_FSR_sft_chat.py"))
     require(len(report_matches) == 1, "locate official IF-SFT FSR scorer")
     report = report_matches[0].read_text(encoding="utf-8")
     require("calc_FSR_from_jsonl" in report, "official IF-SFT calc_FSR_from_jsonl available")
