@@ -1,0 +1,9 @@
+.venv-vptq/
+upstream/
+results/
+artifacts/
+env/
+__pycache__/
+*.pyc
+*.log
+.hf-cache/
