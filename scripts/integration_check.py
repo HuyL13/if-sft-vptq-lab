@@ -56,7 +56,9 @@ def check_runtime_imports() -> None:
     require(_prepare_4d_causal_attention_mask is not None, "Transformers causal-mask helper used by QuIP#")
 
     X = np.asarray([[0.0, 0.0], [0.1, 0.2], [4.0, 4.0], [4.2, 4.1]], dtype=np.float32)
-    w_torch = torch.ones(4, device="cuda", dtype=torch.float32)
+    w2d = torch.tensor([[1.0, 2.0], [1.5, 2.5], [3.0, 4.0], [3.5, 4.5]], device="cuda")
+    w_torch = w2d.mean(dim=1)
+    require(w_torch.ndim == 1 and len(w_torch) == len(X), "VPTQ residual Hessian weights reduce to one scalar per vector")
     device_index = w_torch.device.index if w_torch.is_cuda else 0
     w = w_torch.to(torch.float32).detach().cpu().numpy()
     km = KMeans(n_clusters=2, tol=1e-5, init="random", max_iter=3, random_state=0, n_init=1)
@@ -64,7 +66,7 @@ def check_runtime_imports() -> None:
         km.fit(X, sample_weight=w)
     centers = km.cluster_centers_
     labels = km.labels_
-    require(hasattr(centers, "shape") and tuple(centers.shape) == (2, 2), "cuML KMeans.fit with NumPy sample_weight")
+    require(hasattr(centers, "shape") and tuple(centers.shape) == (2, 2), "cuML KMeans.fit with 1-D NumPy sample_weight")
     require(len(labels) == 4, "cuML KMeans labels API used by VPTQ")
     centers_torch = torch.from_numpy(centers)
     require(tuple(centers_torch.shape) == (2, 2), "cuML cluster_centers_ remains NumPy-compatible for VPTQ")
@@ -103,6 +105,8 @@ def check_vptq_source_contract() -> None:
 
     q = quantizer_path.read_text(encoding="utf-8")
     require("cuml.cluster.KMeans" in q, "VPTQ upstream cuML KMeans path present")
+    require(q.count("vector_weights = vector_weights.mean(dim=1) if vector_weights is not None else None") == 2,
+            "VPTQ main and residual KMeans reduce reshaped weights to 1-D")
     require(q.count("vector_weights = vector_weights.to(torch.float32).detach().cpu().numpy()") == 2,
             "VPTQ cuML 26.8 sample_weight compatibility patch present at both KMeans paths")
     require(q.count("_kmeans.fit(sub_vectors, sample_weight=vector_weights)") == 2,
