@@ -71,9 +71,7 @@ def patch_vptq_for_colab() -> None:
         raise RuntimeError("Pinned VPTQ llama.py changed unexpectedly; refusing an unverified patch")
 
     # 2) The pinned VPTQ code passes a CUDA torch.Tensor as cuML KMeans
-    # `sample_weight`. Old cuML accepted that through its input layer, but current
-    # Colab-compatible cuML 26.8 raises:
-    #   TypeError: Cannot interpret 'torch.float32' as a data type
+    # `sample_weight`. Current Colab-compatible cuML 26.8 rejects that dtype.
     # Convert ONLY sample_weight to float32 NumPy before KMeans.fit. The values and
     # weighting are unchanged; sub_vectors are already converted to NumPy upstream.
     quantizer_py = UPSTREAM / "VPTQ" / "vptq" / "quantizer.py"
@@ -91,7 +89,6 @@ def patch_vptq_for_colab() -> None:
     )
     count = qtext.count(old_fit)
     if count:
-        # Both main-codebook and residual-codebook KMeans paths use this exact block.
         qtext = qtext.replace(old_fit, new_fit)
         quantizer_py.write_text(qtext, encoding="utf-8")
         print(f"[PATCH] {quantizer_py}: converted cuML sample_weight Torch->NumPy at {count} call site(s)")
@@ -99,6 +96,33 @@ def patch_vptq_for_colab() -> None:
         print(f"[PATCH] already applied: {quantizer_py}")
     else:
         raise RuntimeError("Pinned VPTQ quantizer.py changed unexpectedly; cuML compatibility patch not applied")
+
+    # 3) Pinned VPTQ declares inverse Hessians optional: layer_quantizer passes
+    # inv_hessian=None when --inv_hessian_path is omitted, and VPTQ.vptq() contains
+    # the fallback that computes the inverse/Cholesky form from the ordinary Hessian.
+    # But fast_vector_quant() unconditionally clones self.inv_hessian before reaching
+    # that fallback, causing AttributeError: 'NoneType' object has no attribute 'clone'.
+    # Preserve None here so the existing upstream fallback is actually used.
+    vptq_py = UPSTREAM / "VPTQ" / "vptq" / "vptq.py"
+    vtext = vptq_py.read_text(encoding="utf-8")
+    old_inv = "inv_hessian = self.inv_hessian.clone().to('cpu')"
+    new_inv = "inv_hessian = self.inv_hessian.clone().to('cpu') if self.inv_hessian is not None else None"
+    old_cpu = "inv_hessian = inv_hessian.to('cpu')\n        # end of weight and hessian preprocess"
+    new_cpu = "if inv_hessian is not None:\n            inv_hessian = inv_hessian.to('cpu')\n        # end of weight and hessian preprocess"
+    changed = False
+    if old_inv in vtext:
+        vtext = vtext.replace(old_inv, new_inv, 1)
+        changed = True
+    if old_cpu in vtext:
+        vtext = vtext.replace(old_cpu, new_cpu, 1)
+        changed = True
+    if changed:
+        vptq_py.write_text(vtext, encoding="utf-8")
+        print(f"[PATCH] {vptq_py}: allow inv_hessian=None and use upstream on-the-fly inverse fallback")
+    elif new_inv in vtext and new_cpu in vtext:
+        print(f"[PATCH] already applied: {vptq_py}")
+    else:
+        raise RuntimeError("Pinned VPTQ vptq.py changed unexpectedly; inverse-Hessian compatibility patch not applied")
 
 
 def install_dependencies() -> None:
