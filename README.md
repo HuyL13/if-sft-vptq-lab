@@ -14,15 +14,15 @@ The quantized conditions are **weight VQ**, not KV-cache quantization.
 
 Model: `cnut1648/LLaMA2-7B-fingerprinted-SFT`
 
-Upstreams (pinned by commit; see `upstream-lock.json`):
+Pinned upstreams are recorded in `upstream-lock.json`:
 
-- Microsoft VPTQ `algorithm`: https://github.com/microsoft/VPTQ/tree/algorithm
-- IF-SFT / Model-Fingerprint: https://github.com/cnut1648/Model-Fingerprint
-- Cornell QTIP: used only for its upstream LLaMA Hessian collector, because VPTQ's Hessian loader explicitly derives from the QuIP#/QTIP file format.
+- Microsoft VPTQ `algorithm` commit: quantization core and packed model format
+- IF-SFT / Model-Fingerprint: dataset/protocol and official FSR scorer
+- Cornell QuIP#: official offline LLaMA Hessian collector
 
 The pipeline calls the original upstream `calc_FSR_from_jsonl()` for official FSR and records exact-key success separately.
 
-## Why these 3-bit / 4-bit settings?
+## 3-bit / 4-bit settings
 
 `vptq_3bit` follows the Microsoft VPTQ algorithm tutorial:
 
@@ -30,56 +30,85 @@ The pipeline calls the original upstream `calc_FSR_from_jsonl()` for official FS
 v8-k65536-256 = 16/8 + 8/8 = 3 nominal index bits/weight
 ```
 
-`vptq_4bit` follows the **VPTQ-community reproduced LLaMA-2 baseline** named `Llama-2-7b-hf-v6-k4096-4096`:
+`vptq_4bit` uses the reproduced LLaMA-2 VPTQ configuration:
 
 ```text
 v6-k4096-4096 = 12/6 + 12/6 = 4 nominal index bits/weight
 ```
 
-This LLaMA-2-specific 4-bit configuration is preferred over a synthetic `v8-k65536-65536` setting because it is upstream/community-reproduced for LLaMA-2 and requires far cheaper 4096-cluster k-means. Exact settings are also committed under `configs/`.
-
 These are nominal index BPW; codebook/metadata overhead is separate.
 
 ## Hessians
 
-VPTQ requires `{layer}_{qkv|o|up|down}.pt` Hessian files. The VPTQ algorithm release does not include a LLaMA-2 Hessian collection script, so this repo uses the pinned upstream Cornell QTIP LLaMA collector rather than implementing a custom estimator.
+VPTQ requires 128 files named `{layer}_{qkv|o|up|down}.pt`. Its pinned `vptq/utils/hessian.py` consumes the fields:
 
-If `VPTQ_HESSIAN_DIR` is unset, the pipeline generates Hessians **from the fingerprinted checkpoint itself** into:
+```text
+flatH
+mu
+n
+```
+
+The repo therefore uses **QuIP# `hessian_offline_llama.py`**, not QTIP's newer collector. This distinction matters: the QTIP collector used earlier does not emit the `mu` field required by VPTQ.
+
+For Python-3.13/Colab compatibility, a runtime copy of the pinned QuIP# collector changes only:
+
+```python
+from lib import utils
+```
+
+to a tiny source-pinned shim containing the QuIP# Hessian utility functions actually used by the collector. This avoids importing unrelated QuIP# inference/codebook CUDA extensions. The collector body and Hessian equations remain upstream.
+
+If `VPTQ_HESSIAN_DIR` is unset, Hessians are generated from the fingerprinted checkpoint into:
 
 ```text
 artifacts/hessians_llama2_7b_fingerprinted/
 ```
 
-Colab-practical defaults are:
+Colab-safe defaults:
 
 ```text
-HESSIAN_DEVSET_SIZE=512
+HESSIAN_DEVSET_SIZE=64
 HESSIAN_CTX_SIZE=4096
 HESSIAN_BATCH_SIZE=1
+HESSIAN_CHUNK_SIZE=64
+HESSIAN_SAMPLE_PROC=4
 ```
 
-For the upstream collector's full default sample count:
+QuIP#'s original sample count can be requested with:
 
 ```bash
-export HESSIAN_DEVSET_SIZE=8192
+export HESSIAN_DEVSET_SIZE=256
+export HESSIAN_CHUNK_SIZE=256
 ```
 
-This is much slower. For attack screening, 512 is the default; the chosen value is visible in the run command/log.
+After generation, the launcher checks all 128 files and additionally opens representative `qkv/o/up/down` Hessians to verify `flatH + mu + n`, expected LLaMA-2-7B dimensions, and flattened-Hessian sizes before starting VPTQ.
 
-You can also provide an existing compatible directory:
+## Colab environment
 
-```bash
-export VPTQ_HESSIAN_DIR=/content/hessians-llama2-7b
-export VPTQ_INV_HESSIAN_DIR=/content/invhessians-llama2-7b   # optional
-```
+The repo **does not create a venv and does not install/reinstall/downgrade Torch**. It uses the Python/Torch/CUDA stack already provided by Colab and checks that the Torch version, CUDA version and `torch.__file__` remain unchanged.
 
-The launcher validates all 128 expected Hessian files and refuses silent cross-architecture substitution.
+The pinned VPTQ loader originally requests old `flash_attention_2`. On current Colab this one loader setting is changed to Transformers SDPA so the experiment does not build legacy `flash-attn`; the VPTQ quantization core is otherwise kept on the pinned upstream implementation.
 
-## Colab
+## Integration preflight
 
-A100 40GB is recommended. The launcher creates an isolated Python 3.10 environment under `.venv-vptq`; Colab's system Torch is snapshotted before/after and must remain unchanged.
+Every non-`--setup-only` run now executes `scripts.integration_check` **before downloading/loading the 7B model**. It checks:
 
-First setup/smoke test:
+- all local Python files compile
+- all upstream commit pins
+- CUDA is visible to existing Colab Torch
+- FastChat Vicuna prompt template
+- Transformers causal-mask helper used by QuIP#
+- cuML/CuPy imports
+- a real tiny `cuml.cluster.KMeans.fit()` using a Torch CUDA `sample_weight`, matching VPTQ's call shape
+- VPTQ Hessian loader requires `flatH/mu/n`
+- QuIP# collector writes `flatH/mu/n/ct`
+- runtime QuIP# collector imports and `--help` executes
+- the source-pinned Hessian hook correctly accumulates both second moment and mean
+- VPTQ `run_vptq.py` imports
+- the exact 3-bit and 4-bit list-valued CLI arguments parse through VPTQ's own `HfArgumentParser`
+- official IF-SFT dataset/scorer files and target key are present
+
+Run only setup + preflight with:
 
 ```bash
 %%bash
@@ -88,15 +117,34 @@ cd /content
 rm -rf if-sft-vptq-lab
 git clone https://github.com/HuyL13/if-sft-vptq-lab.git
 cd if-sft-vptq-lab
-bash run_full.sh --setup-only
+bash run_full.sh --preflight-only
 ```
 
-Recommended staged first run:
+If this prints:
+
+```text
+[INTEGRATION OK] ALL PREFLIGHT INTEGRATION CHECKS PASSED
+```
+
+then proceed to the expensive model/Hessian/VPTQ stages.
+
+## Full run
 
 ```bash
 %%bash
 set -euo pipefail
-cd /content/if-sft-vptq-lab
+cd /content
+rm -rf if-sft-vptq-lab
+git clone https://github.com/HuyL13/if-sft-vptq-lab.git
+cd if-sft-vptq-lab
+git rev-parse HEAD
+bash run_full.sh
+```
+
+Recommended staged debugging run:
+
+```bash
+bash run_full.sh --preflight-only
 bash run_full.sh --baseline-only
 bash run_full.sh --hessian-only
 bash run_full.sh --quant-only 4
@@ -104,36 +152,7 @@ bash run_full.sh --quant-only 3
 bash run_full.sh --eval-only
 ```
 
-Or, after setup, run everything:
-
-```bash
-%%bash
-set -euo pipefail
-cd /content/if-sft-vptq-lab
-bash run_full.sh --fsr-only
-```
-
-The released VPTQ `run_vptq.py` also runs its built-in WikiText-2/C4-new PPL pass after packing (`--new_eval`). Those PPL files are copied into the condition results when produced.
-
-Useful modes:
-
-```bash
-bash run_full.sh --setup-only
-bash run_full.sh --baseline-only
-bash run_full.sh --hessian-only
-bash run_full.sh --quant-only 4
-bash run_full.sh --quant-only 3
-bash run_full.sh --eval-only
-FORCE=1 bash run_full.sh --fsr-only
-```
-
-For a faster pipeline smoke test, lower only k-means iterations:
-
-```bash
-VPTQ_KITER=10 bash run_full.sh --quant-only 4
-```
-
-Do not use reduced-iteration smoke results as final experiment numbers.
+VPTQ's released `run_vptq.py` also runs its built-in WikiText-2/C4-new PPL pass after packing via `--new_eval`.
 
 ## Outputs
 
@@ -154,24 +173,23 @@ results/
   logs/run_full.log
 artifacts/
   hessians_llama2_7b_fingerprinted/
+  runtime_patches/
   vptq_4bit/
   vptq_3bit/
 env/
 ```
 
-Each quantized artifact records the exact upstream command, elapsed time, centroid configuration and packed-model path.
-
 ## Reproducibility rules
 
-- Weight quantization comes from Microsoft's unmodified VPTQ algorithm code path.
-- Hessian collection comes from pinned Cornell QTIP upstream code, not a local reimplementation.
-- Official FSR comes from `cnut1648/Model-Fingerprint/report_FSR_sft_chat.py` via the original `calc_FSR_from_jsonl()`.
-- The checkpoint being quantized is the fingerprinted checkpoint itself, not base LLaMA-2.
+- Weight-vector quantization uses Microsoft's pinned VPTQ algorithm core.
+- Hessian collection uses pinned Cornell QuIP# equations/collector, with only its broad utility import redirected to a minimal source-pinned Hessian shim.
+- Official FSR comes from the original `Model-Fingerprint/report_FSR_sft_chat.py` function.
+- The quantized checkpoint is `cnut1648/LLaMA2-7B-fingerprinted-SFT`, not base LLaMA-2.
 - `exact_key_FSR` is diagnostic only; it is not called official FSR.
 - No silent fallback to FP/BF16 is allowed when VPTQ loading fails.
-- No silent use of Llama-3/Qwen Hessians is allowed.
-- System Colab Torch must be unchanged after setup/run.
+- No cross-architecture Hessian substitution is allowed.
+- Colab system Torch must remain unchanged.
 
 ## Status
 
-Integration is pushed and source-pinned, but a full A100 7B run has not been executed from this authoring environment. Start with `--setup-only`, then `--baseline-only`, then `--hessian-only` before committing to both full VPTQ sweeps.
+The repo now includes source-contract and executable preflight integration tests. A complete multi-hour A100 7B VPTQ sweep still needs to run on the target Colab GPU; the authoring environment here cannot execute that GPU workload itself.
