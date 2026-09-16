@@ -88,6 +88,11 @@ def run_baseline(dataset: Path, force: bool) -> dict:
     return result
 
 
+def report() -> None:
+    invoke_env("scripts.compare_keys")
+    invoke_env("scripts.summarize")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--setup-only", action="store_true")
@@ -126,12 +131,12 @@ def main():
             out = run_inference(condition, str(model), "vptq", dataset, force)
             score(condition, out)
             collect_ppl(bits, condition)
-        invoke_env("scripts.summarize")
+        report()
         return
 
     run_baseline(dataset, force)
     if a.baseline_only:
-        invoke_env("scripts.summarize")
+        report()
         return
 
     for bits in (4, 3):
@@ -141,7 +146,7 @@ def main():
         score(condition, out)
         collect_ppl(bits, condition)
 
-    invoke_env("scripts.summarize")
+    report()
     print("[REPORT]", RESULTS / "summary.md")
 
 
