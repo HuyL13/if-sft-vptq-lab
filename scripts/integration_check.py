@@ -101,6 +101,12 @@ def check_vptq_source_contract() -> None:
     require(q.count("_kmeans.fit(sub_vectors, sample_weight=vector_weights)") >= 2,
             "VPTQ main and residual KMeans weighted fit calls remain present")
 
+    v = (UPSTREAM / "VPTQ" / "vptq" / "vptq.py").read_text(encoding="utf-8")
+    require("if self.inv_hessian is not None else None" in v,
+            "VPTQ fast_vector_quant accepts missing inverse-Hessian files")
+    require("if inv_hessian is None:" in v and "torch.linalg.cholesky(hessian)" in v,
+            "VPTQ on-the-fly inverse Hessian fallback remains active")
+
 
 def check_quip_hessian_contract() -> None:
     quip = UPSTREAM / "quip-sharp"
