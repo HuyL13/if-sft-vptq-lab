@@ -1,0 +1,13 @@
+{
+  "nominal_bpw": 3,
+  "vector_len": 8,
+  "num_centroids": 65536,
+  "num_res_centroids": 256,
+  "group_num": 1,
+  "npercent": 0,
+  "blocksize": 128,
+  "kmeans_mode": "hessian",
+  "kiter": 100,
+  "ktol": 1e-5,
+  "origin": "microsoft/VPTQ algorithm tutorial"
+}
