@@ -1,0 +1,20 @@
+{
+  "repositories": {
+    "microsoft/VPTQ": {
+      "role": "weight vector quantization algorithm",
+      "url": "https://github.com/microsoft/VPTQ.git",
+      "commit": "5a8dfb93d2a7475151f66c559a44e057fe5322f9"
+    },
+    "cnut1648/Model-Fingerprint": {
+      "role": "IF-SFT dataset, prompt protocol and official FSR",
+      "url": "https://github.com/cnut1648/Model-Fingerprint.git",
+      "commit": "4ae5e8a124c37f25a3711c407e85a45fda6ecb08"
+    },
+    "Cornell-RelaxML/qtip": {
+      "role": "upstream LLaMA Hessian collector compatible with VPTQ's Hessian format",
+      "url": "https://github.com/Cornell-RelaxML/qtip.git",
+      "commit": "e90c6688c8dfae326a3a81b5eb032db7c6680ec0"
+    }
+  },
+  "model": "cnut1648/LLaMA2-7B-fingerprinted-SFT"
+}
