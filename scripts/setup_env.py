@@ -55,6 +55,9 @@ def _assert_torch_unchanged(py: Path | str, expected: list[str], stage: str) -> 
 
 
 def patch_vptq_for_colab() -> None:
+    # 1) Current Colab does not need the legacy flash-attn==2.5.8 build used by the
+    # pinned 2024 environment. This changes only the attention implementation used
+    # while loading/running LLaMA; it does not change VPTQ quantization math.
     llama_py = UPSTREAM / "VPTQ" / "vptq" / "models" / "llama.py"
     text = llama_py.read_text(encoding="utf-8")
     old = 'attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16'
@@ -66,6 +69,36 @@ def patch_vptq_for_colab() -> None:
         print(f"[PATCH] already applied: {llama_py}")
     else:
         raise RuntimeError("Pinned VPTQ llama.py changed unexpectedly; refusing an unverified patch")
+
+    # 2) The pinned VPTQ code passes a CUDA torch.Tensor as cuML KMeans
+    # `sample_weight`. Old cuML accepted that through its input layer, but current
+    # Colab-compatible cuML 26.8 raises:
+    #   TypeError: Cannot interpret 'torch.float32' as a data type
+    # Convert ONLY sample_weight to float32 NumPy before KMeans.fit. The values and
+    # weighting are unchanged; sub_vectors are already converted to NumPy upstream.
+    quantizer_py = UPSTREAM / "VPTQ" / "vptq" / "quantizer.py"
+    qtext = quantizer_py.read_text(encoding="utf-8")
+    old_fit = (
+        "with cupy.cuda.Device(vector_weights.device.index):\n"
+        "                    _kmeans.fit(sub_vectors, sample_weight=vector_weights)"
+    )
+    new_fit = (
+        "device_index = vector_weights.device.index if (vector_weights is not None and vector_weights.is_cuda) else 0\n"
+        "                if vector_weights is not None:\n"
+        "                    vector_weights = vector_weights.to(torch.float32).detach().cpu().numpy()\n"
+        "                with cupy.cuda.Device(device_index):\n"
+        "                    _kmeans.fit(sub_vectors, sample_weight=vector_weights)"
+    )
+    count = qtext.count(old_fit)
+    if count:
+        # Both main-codebook and residual-codebook KMeans paths use this exact block.
+        qtext = qtext.replace(old_fit, new_fit)
+        quantizer_py.write_text(qtext, encoding="utf-8")
+        print(f"[PATCH] {quantizer_py}: converted cuML sample_weight Torch->NumPy at {count} call site(s)")
+    elif "vector_weights = vector_weights.to(torch.float32).detach().cpu().numpy()" in qtext:
+        print(f"[PATCH] already applied: {quantizer_py}")
+    else:
+        raise RuntimeError("Pinned VPTQ quantizer.py changed unexpectedly; cuML compatibility patch not applied")
 
 
 def install_dependencies() -> None:
@@ -157,7 +190,7 @@ def main() -> None:
     write_json(ENV / "system-after.json", after)
     if before.get("torch") != after.get("torch") or before.get("cuda") != after.get("cuda") or before.get("torch_file") != after.get("torch_file"):
         raise RuntimeError("Colab Torch/CUDA changed during setup")
-    print("[OK] setup complete: no venv, no Torch reinstall, Python 3.13-compatible cuML")
+    print("[OK] setup complete: no venv, no Torch reinstall, Python 3.13-compatible VPTQ/cuML")
 
 
 if __name__ == "__main__":
