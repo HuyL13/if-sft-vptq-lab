@@ -1,0 +1,135 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import time
+
+from .common import ARTIFACTS, MODEL_ID, ROOT, UPSTREAM, clean_env, run, write_json
+from .setup_env import env_python
+
+CONFIGS = {
+    3: {"vector_len": 8, "num_centroids": 65536, "num_res_centroids": 256},
+    4: {"vector_len": 8, "num_centroids": 65536, "num_res_centroids": 65536},
+}
+
+
+def newest_dir(root: Path, before: set[Path]) -> Path:
+    after = {p for p in root.iterdir() if p.is_dir()} if root.exists() else set()
+    created = sorted(after - before, key=lambda p: p.stat().st_mtime)
+    if not created:
+        # Resume-friendly fallback: upstream timestamp dir may already exist.
+        existing = sorted(after, key=lambda p: p.stat().st_mtime)
+        if not existing:
+            raise RuntimeError(f"No VPTQ output directory found under {root}")
+        return existing[-1]
+    return created[-1]
+
+
+def validate_hessian_dir(path: Path) -> None:
+    if not path.is_dir():
+        raise RuntimeError(f"Hessian directory not found: {path}")
+    # LLaMA-2-7B has 32 layers. VPTQ shares q/k/v -> qkv and gate/up -> up.
+    expected = []
+    for layer in range(32):
+        for suffix in ("qkv", "o", "up", "down"):
+            expected.append(path / f"{layer}_{suffix}.pt")
+    missing = [str(p) for p in expected if not p.exists()]
+    if missing:
+        raise RuntimeError(f"Hessian directory is incomplete ({len(missing)} missing); first: {missing[:8]}")
+
+
+def quantize(bits: int, *, kiter: int = 100, ktol: float = 1e-5, seq_len: int = 4096) -> Path:
+    if bits not in CONFIGS:
+        raise ValueError(bits)
+    hessian = os.environ.get("VPTQ_HESSIAN_DIR")
+    if not hessian:
+        raise RuntimeError("Set VPTQ_HESSIAN_DIR to LLaMA-2-7B-compatible upstream-format Hessians")
+    hessian_path = Path(hessian).resolve()
+    validate_hessian_dir(hessian_path)
+    inv = os.environ.get("VPTQ_INV_HESSIAN_DIR")
+    inv_path = Path(inv).resolve() if inv else None
+    if inv_path is not None:
+        validate_hessian_dir(inv_path)
+
+    cfg = CONFIGS[bits]
+    base = ARTIFACTS / f"vptq_{bits}bit"
+    base.mkdir(parents=True, exist_ok=True)
+    manifest = base / "manifest.json"
+    if manifest.exists() and not os.environ.get("FORCE"):
+        state = json.loads(manifest.read_text(encoding="utf-8"))
+        packed = Path(state["packed_model"])
+        if packed.exists():
+            print(f"[SKIP] verified manifest exists for VPTQ {bits}-bit: {packed}")
+            return packed
+
+    before = {p for p in base.iterdir() if p.is_dir()}
+    cmd = [
+        env_python(), "run_vptq.py",
+        "--model_name", MODEL_ID,
+        "--output_dir", str(base),
+        "--vector_lens", "-1", str(cfg["vector_len"]),
+        "--group_num", "1",
+        "--num_centroids", "-1", str(cfg["num_centroids"]),
+        "--num_res_centroids", "-1", str(cfg["num_res_centroids"]),
+        "--npercent", "0",
+        "--blocksize", "128",
+        "--seq_len", str(seq_len),
+        "--kmeans_mode", "hessian",
+        "--num_gpus", "1",
+        "--save_model",
+        "--save_packed_model",
+        "--hessian_path", str(hessian_path),
+        "--ktol", str(ktol),
+        "--kiter", str(kiter),
+    ]
+    # enable_perm/enable_norm are present in the tutorial but upstream explicitly marks
+    # them as missing/not tested. Do not add them silently for the final reproducible path.
+    if inv_path is not None:
+        cmd.extend(["--inv_hessian_path", str(inv_path)])
+    if os.environ.get("VPTQ_RUN_PPL", "1") == "1":
+        cmd.append("--new_eval")
+
+    env = clean_env()
+    env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    t0 = time.time()
+    run(cmd, cwd=UPSTREAM / "VPTQ", env=env)
+    elapsed = time.time() - t0
+    result_dir = newest_dir(base, before)
+    packed = result_dir / "packed_model"
+    if not packed.exists():
+        raise RuntimeError(f"Upstream VPTQ did not create packed_model under {result_dir}")
+    write_json(manifest, {
+        "condition": f"vptq_{bits}bit",
+        "model": MODEL_ID,
+        "nominal_bpw": bits,
+        **cfg,
+        "group_num": 1,
+        "npercent": 0,
+        "blocksize": 128,
+        "seq_len": seq_len,
+        "kiter": kiter,
+        "ktol": ktol,
+        "hessian_path": str(hessian_path),
+        "inv_hessian_path": str(inv_path) if inv_path else None,
+        "elapsed_seconds": elapsed,
+        "result_dir": str(result_dir),
+        "packed_model": str(packed),
+        "command": [str(x) for x in cmd],
+    })
+    return packed
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("bits", type=int, choices=[3, 4])
+    p.add_argument("--kiter", type=int, default=int(os.environ.get("VPTQ_KITER", "100")))
+    p.add_argument("--ktol", type=float, default=float(os.environ.get("VPTQ_KTOL", "1e-5")))
+    p.add_argument("--seq-len", type=int, default=int(os.environ.get("VPTQ_SEQ_LEN", "4096")))
+    args = p.parse_args()
+    print(quantize(args.bits, kiter=args.kiter, ktol=args.ktol, seq_len=args.seq_len))
+
+
+if __name__ == "__main__":
+    main()
