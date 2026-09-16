@@ -96,6 +96,7 @@ def report() -> None:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--setup-only", action="store_true")
+    p.add_argument("--preflight-only", action="store_true")
     p.add_argument("--baseline-only", action="store_true")
     p.add_argument("--hessian-only", action="store_true")
     p.add_argument("--quant-only", type=int, choices=[3, 4])
@@ -107,6 +108,12 @@ def main():
 
     run([os.environ.get("IF_SFT_SYSTEM_PYTHON", os.sys.executable), "-m", "scripts.setup_env"], cwd=ROOT, env=clean_env())
     if a.setup_only:
+        return
+
+    # Fail before downloading/loading the 7B checkpoint if any cross-repo contract,
+    # import, parser, GPU or Hessian-format assumption is already broken.
+    invoke_env("scripts.integration_check")
+    if a.preflight_only:
         return
 
     dataset = prepare_data()
