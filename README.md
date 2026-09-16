@@ -7,20 +7,38 @@ Weight-only **Vector Post-Training Quantization (VPTQ)** experiment for the publ
 Compare the same fingerprinted model under:
 
 - `bf16` baseline
-- `vptq_4bit`: vector length 8, 65536 main centroids, 65536 residual centroids (~4 bpw index budget)
+- `vptq_4bit`: vector length 6, 4096 main centroids, 4096 residual centroids (~4 bpw index budget)
 - `vptq_3bit`: vector length 8, 65536 main centroids, 256 residual centroids (~3 bpw index budget)
 
 The quantized conditions are **weight VQ**, not KV-cache quantization.
 
 Model: `cnut1648/LLaMA2-7B-fingerprinted-SFT`
 
-Upstreams (pinned by commit):
+Upstreams (pinned by commit; see `upstream-lock.json`):
 
 - Microsoft VPTQ `algorithm`: https://github.com/microsoft/VPTQ/tree/algorithm
 - IF-SFT / Model-Fingerprint: https://github.com/cnut1648/Model-Fingerprint
 - Cornell QTIP: used only for its upstream LLaMA Hessian collector, because VPTQ's Hessian loader explicitly derives from the QuIP#/QTIP file format.
 
 The pipeline calls the original upstream `calc_FSR_from_jsonl()` for official FSR and records exact-key success separately.
+
+## Why these 3-bit / 4-bit settings?
+
+`vptq_3bit` follows the Microsoft VPTQ algorithm tutorial:
+
+```text
+v8-k65536-256 = 16/8 + 8/8 = 3 nominal index bits/weight
+```
+
+`vptq_4bit` follows the **VPTQ-community reproduced LLaMA-2 baseline** named `Llama-2-7b-hf-v6-k4096-4096`:
+
+```text
+v6-k4096-4096 = 12/6 + 12/6 = 4 nominal index bits/weight
+```
+
+This LLaMA-2-specific 4-bit configuration is preferred over a synthetic `v8-k65536-65536` setting because it is upstream/community-reproduced for LLaMA-2 and requires far cheaper 4096-cluster k-means. Exact settings are also committed under `configs/`.
+
+These are nominal index BPW; codebook/metadata overhead is separate.
 
 ## Hessians
 
@@ -73,7 +91,20 @@ cd if-sft-vptq-lab
 bash run_full.sh --setup-only
 ```
 
-Then run the complete experiment:
+Recommended staged first run:
+
+```bash
+%%bash
+set -euo pipefail
+cd /content/if-sft-vptq-lab
+bash run_full.sh --baseline-only
+bash run_full.sh --hessian-only
+bash run_full.sh --quant-only 4
+bash run_full.sh --quant-only 3
+bash run_full.sh --eval-only
+```
+
+Or, after setup, run everything:
 
 ```bash
 %%bash
@@ -82,7 +113,7 @@ cd /content/if-sft-vptq-lab
 bash run_full.sh --fsr-only
 ```
 
-`--fsr-only` still lets upstream `run_vptq.py` execute its built-in WikiText2/C4-new PPL pass because the released script requires an eval mode after packing. Those PPL files are copied into the condition results when produced.
+The released VPTQ `run_vptq.py` also runs its built-in WikiText-2/C4-new PPL pass after packing (`--new_eval`). Those PPL files are copied into the condition results when produced.
 
 Useful modes:
 
@@ -140,15 +171,6 @@ Each quantized artifact records the exact upstream command, elapsed time, centro
 - No silent fallback to FP/BF16 is allowed when VPTQ loading fails.
 - No silent use of Llama-3/Qwen Hessians is allowed.
 - System Colab Torch must be unchanged after setup/run.
-
-## Bit settings
-
-```text
-VPTQ 3-bit: vector_len=8, main=65536 (16/8=2 bpw), residual=256 (8/8=1 bpw)
-VPTQ 4-bit: vector_len=8, main=65536 (16/8=2 bpw), residual=65536 (16/8=2 bpw)
-```
-
-These are nominal index BPW; codebook/metadata overhead is separate from the index budget.
 
 ## Status
 
