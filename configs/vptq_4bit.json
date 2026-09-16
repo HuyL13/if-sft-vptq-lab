@@ -1,0 +1,13 @@
+{
+  "nominal_bpw": 4,
+  "vector_len": 6,
+  "num_centroids": 4096,
+  "num_res_centroids": 4096,
+  "group_num": 1,
+  "npercent": 0,
+  "blocksize": 128,
+  "kmeans_mode": "hessian",
+  "kiter": 100,
+  "ktol": 1e-5,
+  "origin": "VPTQ-community reproduced Llama-2 baseline Llama-2-7b-hf-v6-k4096-4096"
+}
