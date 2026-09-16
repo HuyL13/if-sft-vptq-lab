@@ -20,6 +20,8 @@ VPTQ_URL = "https://github.com/microsoft/VPTQ.git"
 VPTQ_REF = "5a8dfb93d2a7475151f66c559a44e057fe5322f9"  # algorithm branch snapshot
 MF_URL = "https://github.com/cnut1648/Model-Fingerprint.git"
 MF_REF = "4ae5e8a124c37f25a3711c407e85a45fda6ecb08"
+QTIP_URL = "https://github.com/Cornell-RelaxML/qtip.git"
+QTIP_REF = "e90c6688c8dfae326a3a81b5eb032db7c6680ec0"  # used only for upstream Hessian collection
 
 
 def run(cmd: Iterable[str], *, cwd: Path | None = None, env: dict | None = None, check: bool = True):
