@@ -55,13 +55,7 @@ def _assert_torch_unchanged(py: Path | str, expected: list[str], stage: str) -> 
 
 
 def _restore_vptq_patch_targets() -> None:
-    """Reset runtime-patched VPTQ files to the pinned upstream commit first.
-
-    setup_env is intentionally re-run for every resume command. Without this reset,
-    text replacements can patch an already patched file a second time (the previous
-    inverse-Hessian guard did exactly that and produced a duplicate `if` / IndentationError).
-    Restoring the three known patch targets makes setup deterministic and idempotent.
-    """
+    """Reset runtime-patched VPTQ files to the pinned upstream commit first."""
     repo = UPSTREAM / "VPTQ"
     targets = [
         "vptq/models/llama.py",
@@ -85,35 +79,59 @@ def patch_vptq_for_colab() -> None:
     llama_py.write_text(text.replace(old, new, 1), encoding="utf-8")
     print(f"[PATCH] {llama_py}: flash_attention_2 -> sdpa (Colab compatibility)")
 
-    # 2) cuML 26.8 rejects CUDA torch.Tensor sample_weight. Keep weighted KMeans,
-    # converting only the sample-weight representation to float32 NumPy.
+    # 2) cuML 26.8 requires sample_weight to be a 1-D NumPy array.
+    # Upstream main-codebook KMeans already reduces reshaped Hessian weights with
+    # mean(dim=1); the residual-codebook path forgot that reduction and passes a
+    # [num_vectors, vector_len] tensor. Preserve the intended weighting semantics by
+    # applying the same mean(dim=1) reduction in the residual path, then convert the
+    # resulting 1-D tensor to float32 NumPy in both paths.
     quantizer_py = UPSTREAM / "VPTQ" / "vptq" / "quantizer.py"
     qtext = quantizer_py.read_text(encoding="utf-8")
-    old_fit = (
-        "with cupy.cuda.Device(vector_weights.device.index):\n"
+
+    main_old = (
+        "vector_weights = vector_weights.mean(dim=1) if vector_weights is not None else None\n"
+        "                # convert to numpy and float32 to avoid error\n"
+        "                sub_vectors = sub_vectors.to(torch.float32).cpu().numpy()\n"
+        "                with cupy.cuda.Device(vector_weights.device.index):\n"
         "                    _kmeans.fit(sub_vectors, sample_weight=vector_weights)"
     )
-    new_fit = (
-        "device_index = vector_weights.device.index if (vector_weights is not None and vector_weights.is_cuda) else 0\n"
+    main_new = (
+        "vector_weights = vector_weights.mean(dim=1) if vector_weights is not None else None\n"
+        "                # cuML 26.8 requires 1-D NumPy sample weights.\n"
+        "                device_index = vector_weights.device.index if (vector_weights is not None and vector_weights.is_cuda) else 0\n"
         "                if vector_weights is not None:\n"
         "                    vector_weights = vector_weights.to(torch.float32).detach().cpu().numpy()\n"
+        "                sub_vectors = sub_vectors.to(torch.float32).cpu().numpy()\n"
         "                with cupy.cuda.Device(device_index):\n"
         "                    _kmeans.fit(sub_vectors, sample_weight=vector_weights)"
     )
-    count = qtext.count(old_fit)
-    if count != 2:
-        raise RuntimeError(f"Expected exactly 2 pinned VPTQ cuML weighted-fit call sites, found {count}")
-    quantizer_py.write_text(qtext.replace(old_fit, new_fit), encoding="utf-8")
-    print(f"[PATCH] {quantizer_py}: converted cuML sample_weight Torch->NumPy at {count} call sites")
+    if qtext.count(main_old) != 1:
+        raise RuntimeError("Unexpected pinned VPTQ main-codebook KMeans pattern")
+    qtext = qtext.replace(main_old, main_new, 1)
+
+    residual_old = (
+        "sub_vectors = sub_vectors.to(torch.float32).cpu().numpy()\n"
+        "                with cupy.cuda.Device(vector_weights.device.index):\n"
+        "                    _kmeans.fit(sub_vectors, sample_weight=vector_weights)"
+    )
+    residual_new = (
+        "vector_weights = vector_weights.mean(dim=1) if vector_weights is not None else None\n"
+        "                device_index = vector_weights.device.index if (vector_weights is not None and vector_weights.is_cuda) else 0\n"
+        "                if vector_weights is not None:\n"
+        "                    vector_weights = vector_weights.to(torch.float32).detach().cpu().numpy()\n"
+        "                sub_vectors = sub_vectors.to(torch.float32).cpu().numpy()\n"
+        "                with cupy.cuda.Device(device_index):\n"
+        "                    _kmeans.fit(sub_vectors, sample_weight=vector_weights)"
+    )
+    if qtext.count(residual_old) != 1:
+        raise RuntimeError("Unexpected pinned VPTQ residual-codebook KMeans pattern")
+    qtext = qtext.replace(residual_old, residual_new, 1)
+
+    quantizer_py.write_text(qtext, encoding="utf-8")
+    print(f"[PATCH] {quantizer_py}: cuML 26.8 1-D NumPy sample weights fixed for main + residual KMeans")
 
     # 3) --inv_hessian_path is optional in layer_quantizer, and VPTQ.vptq() already
     # knows how to derive the inverse from the ordinary Hessian when passed None.
-    # Pinned fast_vector_quant() nevertheless dereferences None in THREE places:
-    #   a) initial self.inv_hessian.clone()
-    #   b) first-round _inv_hessian clone
-    #   c) residual-round _inv_hessian clone
-    # It also unconditionally calls .to('cpu') on the optional tensor. Patch every
-    # dereference while preserving the existing on-the-fly Cholesky fallback.
     vptq_py = UPSTREAM / "VPTQ" / "vptq" / "vptq.py"
     vtext = vptq_py.read_text(encoding="utf-8")
 
@@ -139,7 +157,6 @@ def patch_vptq_for_colab() -> None:
     vptq_py.write_text(vtext, encoding="utf-8")
     print(f"[PATCH] {vptq_py}: optional inverse Hessian fixed at initial + {round_count} round call sites")
 
-    # Syntax-check the patched upstream files immediately, before dependency/setup work.
     run([sys.executable, "-m", "py_compile", str(llama_py), str(quantizer_py), str(vptq_py)])
     print("[PATCH] patched VPTQ files compile: OK")
 
