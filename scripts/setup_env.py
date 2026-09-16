@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import shutil
 import sys
 
 from .common import (
@@ -24,8 +23,6 @@ from .common import (
     write_json,
 )
 
-ENV_PREFIX = ROOT / ".venv-vptq"
-
 
 def system_snapshot() -> dict:
     code = (
@@ -38,58 +35,31 @@ def system_snapshot() -> dict:
 
 
 def env_python() -> Path:
-    return ENV_PREFIX / "bin" / "python"
+    # Kept as a compatibility helper for the rest of the pipeline.
+    # There is intentionally NO venv: every stage uses the current Colab Python.
+    return Path(sys.executable)
 
 
-def create_env() -> None:
-    # IMPORTANT: do not install/reinstall/downgrade Torch.  The experiment must reuse
-    # the Torch/CUDA stack already provided by Colab.  A venv with
-    # --system-site-packages gives the experiment access to that exact Torch build
-    # while keeping the remaining Python dependencies local to this repository.
-    if not env_python().exists():
-        run([
-            sys.executable,
-            "-m",
-            "venv",
-            "--system-site-packages",
-            str(ENV_PREFIX),
-        ])
-
-    py = env_python()
-    env = clean_env()
-
-    # Colab images occasionally create a venv without a working pip/ensurepip.
-    # Bootstrap pip into the venv without touching Torch or the system interpreter.
-    probe = run([py, "-m", "pip", "--version"], env=env, check=False)
-    if probe.returncode != 0:
-        system_pip = shutil.which("pip") or shutil.which("pip3")
-        if not system_pip:
-            raise RuntimeError("venv has no pip and no system pip was found")
-        run([system_pip, "--python", str(py), "install", "--upgrade", "pip", "setuptools", "wheel"], env=env)
-    else:
-        run([py, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel", "ninja"], env=env)
-
-    # Guard before installing anything else: the venv must see the exact same Torch
-    # package as Colab's system Python.
-    system_torch = output([
-        sys.executable,
-        "-c",
-        "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.__file__)",
-    ]).splitlines()
-    env_torch = output([
+def _torch_identity(py: Path | str) -> list[str]:
+    return output([
         py,
         "-c",
         "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.__file__)",
     ]).splitlines()
-    if system_torch != env_torch:
-        raise RuntimeError(
-            "The experiment venv is not reusing Colab system Torch exactly. "
-            f"system={system_torch!r}, venv={env_torch!r}"
-        )
-    print(f"[GUARD] reusing Colab Torch {system_torch[0]} / CUDA {system_torch[1]}")
 
-    # Install only non-Torch dependencies.  --no-deps on packages that may declare
-    # their own Torch constraints prevents pip from replacing the Colab Torch wheel.
+
+def install_dependencies() -> None:
+    py = env_python()
+    env = clean_env()
+    before = _torch_identity(py)
+    print(f"[GUARD] using Colab system Python: {py}")
+    print(f"[GUARD] using existing Torch {before[0]} / CUDA {before[1]}")
+    print(f"[GUARD] Torch path: {before[2]}")
+    print("[GUARD] this setup never runs pip install torch/torchvision/torchaudio")
+
+    # Install only non-Torch dependencies into the current Colab environment.
+    # Packages with their own Torch dependency are installed with --no-deps where
+    # necessary so pip cannot replace the preinstalled Colab Torch wheel.
     run([
         py,
         "-m",
@@ -98,14 +68,25 @@ def create_env() -> None:
         "accelerate",
         "transformers>=4.45,<5",
         "datasets",
-        "sentence_transformers",
-        "fschat",
         "scipy",
         "numpy",
         "pyyaml",
         "huggingface-hub",
         "tqdm",
         "ninja",
+        "fschat",
+    ], env=env)
+
+    # sentence-transformers depends on torch, but the experiment only needs the
+    # package import required by upstream run_vptq.py. Prevent dependency resolution
+    # from touching Torch.
+    run([
+        py,
+        "-m",
+        "pip",
+        "install",
+        "sentence_transformers",
+        "--no-deps",
     ], env=env)
 
     run([
@@ -119,8 +100,8 @@ def create_env() -> None:
         "--no-deps",
     ], env=env)
 
-    # Upstream get_llama() requests flash_attention_2.  Build it against the existing
-    # Colab Torch; never allow pip to pull a different Torch as a dependency.
+    # Upstream VPTQ get_llama() explicitly requests flash_attention_2.
+    # Build against the already-loaded Colab Torch; never let pip install another one.
     run([
         py,
         "-m",
@@ -131,9 +112,8 @@ def create_env() -> None:
         "--no-deps",
     ], env=env)
 
-    # Algorithm path has a pure-PyTorch dequant fallback, so the optional VPTQ CUDA
-    # extension is unnecessary for correctness.  Keep Microsoft's Python code path
-    # intact while avoiding an extra CUDA build during setup.
+    # Use Microsoft's Python algorithm path without compiling the optional VPTQ CUDA
+    # extension. --no-deps prevents its package metadata from altering Torch.
     env2 = dict(env)
     env2["SKIP_COMPILE"] = "1"
     run([
@@ -147,24 +127,20 @@ def create_env() -> None:
         "--no-deps",
     ], env=env2)
 
-    # Re-check after dependency installation so a transitive pip dependency cannot
-    # silently replace Torch.
-    env_torch_after = output([
-        py,
-        "-c",
-        "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.__file__)",
-    ]).splitlines()
-    if env_torch_after != system_torch:
+    after = _torch_identity(py)
+    if after != before:
         raise RuntimeError(
             "Torch changed during setup, which is forbidden. "
-            f"before={system_torch!r}, after={env_torch_after!r}"
+            f"before={before!r}, after={after!r}"
         )
+    print("[GUARD] Torch unchanged after dependency installation")
 
 
 def smoke() -> None:
     py = env_python()
     code = (
         "import torch,vptq,transformers,flash_attn; "
+        "print('python',__import__('sys').executable); "
         "print('torch',torch.__version__,'cuda',torch.version.cuda,'torch_file',torch.__file__); "
         "print('gpu',torch.cuda.get_device_name(0)); "
         "print('vptq',vptq.__file__); "
@@ -183,18 +159,16 @@ def main() -> None:
 
     clone_pinned(VPTQ_URL, UPSTREAM / "VPTQ", VPTQ_REF)
     clone_pinned(MF_URL, UPSTREAM / "Model-Fingerprint", MF_REF)
-    # VPTQ's Hessian loader explicitly derives from Cornell's QuIP#/QTIP format.
-    # QTIP is pinned only to generate compatible Hessians for the fingerprinted model.
     clone_pinned(QTIP_URL, UPSTREAM / "qtip", QTIP_REF)
 
-    create_env()
+    install_dependencies()
     smoke()
 
     after = system_snapshot()
     write_json(ENV / "system-after.json", after)
-    if before != after:
-        raise RuntimeError("System Python/Torch snapshot changed during setup")
-    print("[OK] VPTQ environment ready; reused Colab system Torch without reinstalling it")
+    if before.get("torch") != after.get("torch") or before.get("cuda") != after.get("cuda") or before.get("torch_file") != after.get("torch_file"):
+        raise RuntimeError("Colab Torch/CUDA changed during setup")
+    print("[OK] setup complete: no venv created, Colab system Torch reused unchanged")
 
 
 if __name__ == "__main__":
