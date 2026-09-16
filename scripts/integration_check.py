@@ -9,6 +9,7 @@ import sys
 from .common import ROOT, UPSTREAM, VPTQ_REF, MF_REF, QUIP_REF, output, clean_env
 from .prepare_hessians import build_runtime_collector
 from .quantize_vptq import CONFIGS
+from .quip_hessian_utils import DEFAULT_CALIB_DATASET
 
 
 def ok(msg: str) -> None:
@@ -54,9 +55,6 @@ def check_runtime_imports() -> None:
     require(get_conversation_template("vicuna") is not None, "FastChat Vicuna template")
     require(_prepare_4d_causal_attention_mask is not None, "Transformers causal-mask helper used by QuIP#")
 
-    # Exercise the exact *patched* VPTQ cuML call contract. Pinned VPTQ already
-    # converts sub_vectors to float32 NumPy. On cuML 26.8 we also convert the
-    # CUDA Torch sample_weight to float32 NumPy while preserving its values.
     X = np.asarray([[0.0, 0.0], [0.1, 0.2], [4.0, 4.0], [4.2, 4.1]], dtype=np.float32)
     w_torch = torch.ones(4, device="cuda", dtype=torch.float32)
     device_index = w_torch.device.index if w_torch.is_cuda else 0
@@ -68,7 +66,6 @@ def check_runtime_imports() -> None:
     labels = km.labels_
     require(hasattr(centers, "shape") and tuple(centers.shape) == (2, 2), "cuML KMeans.fit with NumPy sample_weight")
     require(len(labels) == 4, "cuML KMeans labels API used by VPTQ")
-    # Pinned VPTQ immediately feeds cluster_centers_ to torch.from_numpy().
     centers_torch = torch.from_numpy(centers)
     require(tuple(centers_torch.shape) == (2, 2), "cuML cluster_centers_ remains NumPy-compatible for VPTQ")
 
@@ -78,6 +75,14 @@ def check_runtime_imports() -> None:
         f"cuml={cuml.__version__} cupy={cupy.__version__}",
         flush=True,
     )
+
+
+def check_calibration_dataset() -> None:
+    from huggingface_hub import HfApi
+    dataset_name = os.environ.get("HESSIAN_CALIB_DATASET", DEFAULT_CALIB_DATASET)
+    info = HfApi().dataset_info(dataset_name)
+    require(info.id.lower() == dataset_name.lower(), f"calibration dataset exists on Hub: {dataset_name}")
+    ok("calibration data will be streamed; full mirror download is not required")
 
 
 def check_vptq_source_contract() -> None:
@@ -179,6 +184,7 @@ def main() -> None:
     check_python_sources()
     check_pins()
     check_runtime_imports()
+    check_calibration_dataset()
     check_vptq_source_contract()
     check_quip_hessian_contract()
     check_vptq_cli()
