@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-from .common import ROOT, UPSTREAM, ENV, VPTQ_URL, VPTQ_REF, MF_URL, MF_REF, clone_pinned, clean_env, ensure_dirs, output, run, write_json
+from .common import ROOT, UPSTREAM, ENV, VPTQ_URL, VPTQ_REF, MF_URL, MF_REF, QTIP_URL, QTIP_REF, clone_pinned, clean_env, ensure_dirs, output, run, write_json
 
 MAMBA = ROOT / ".tools" / "bin" / "micromamba"
 ENV_PREFIX = ROOT / ".venv-vptq"
@@ -38,11 +38,12 @@ def create_env() -> None:
     run([py, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel", "ninja"], env=env)
     # Match Microsoft's released algorithm environment in an isolated prefix.
     run([py, "-m", "pip", "install", "torch==2.5.1", "torchvision", "torchaudio", "--extra-index-url", "https://download.pytorch.org/whl/cu121"], env=env)
-    run([py, "-m", "pip", "install", "accelerate", "transformers>=4.45,<5", "datasets", "sentence_transformers", "fschat", "scipy", "numpy", "pyyaml", "huggingface-hub"], env=env)
+    run([py, "-m", "pip", "install", "accelerate", "transformers>=4.45,<5", "datasets", "sentence_transformers", "fschat", "scipy", "numpy", "pyyaml", "huggingface-hub", "tqdm"], env=env)
     run([py, "-m", "pip", "install", "--extra-index-url", "https://pypi.nvidia.com", "cuml-cu12==24.12.*"], env=env)
     # get_llama() in the upstream algorithm explicitly requests flash_attention_2.
-    # Build only this required dependency, not the optional VPTQ CUDA inference extension.
     run([py, "-m", "pip", "install", "flash-attn==2.5.8", "--no-build-isolation"], env=env)
+    # Algorithm uses a pure-PyTorch dequant fallback, so the optional VPTQ CUDA extension
+    # is not required for correctness. Skipping it keeps Colab setup considerably shorter.
     env2 = dict(env)
     env2["SKIP_COMPILE"] = "1"
     run([py, "-m", "pip", "install", "-e", str(UPSTREAM / "VPTQ"), "--no-build-isolation"], env=env2)
@@ -61,6 +62,9 @@ def main() -> None:
     write_json(ENV / "system-before.json", before)
     clone_pinned(VPTQ_URL, UPSTREAM / "VPTQ", VPTQ_REF)
     clone_pinned(MF_URL, UPSTREAM / "Model-Fingerprint", MF_REF)
+    # VPTQ's Hessian loader explicitly derives from Cornell's QuIP#/QTIP format.
+    # We pin QTIP only to generate compatible Hessians for the actual fingerprinted model.
+    clone_pinned(QTIP_URL, UPSTREAM / "qtip", QTIP_REF)
     create_env()
     smoke()
     after = system_snapshot()
