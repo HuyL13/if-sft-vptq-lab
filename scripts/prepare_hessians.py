@@ -11,29 +11,108 @@ from .setup_env import env_python
 def build_runtime_collector(quip: Path) -> Path:
     """Create a runtime copy of QuIP#'s official offline Hessian collector.
 
-    VPTQ's own hessian loader says its format comes from QuIP#. The QuIP# collector
-    writes the exact fields VPTQ consumes: flatH, mu, n, ct. We keep the upstream
-    collector body unchanged and replace only `from lib import utils` with a tiny
-    source-pinned shim containing the four utility functions this collector uses.
-    This avoids importing unrelated QuIP# inference/codebook CUDA extensions.
+    VPTQ consumes the QuIP# Hessian format (flatH, mu, n, ct). The pinned QuIP#
+    collector predates the current Transformers LLaMA API, so we apply two narrow
+    runtime-only compatibility patches while leaving the Hessian math unchanged:
+      1) replace the heavyweight `lib.utils` import with our source-pinned shim;
+      2) explicitly compute/pass rotary `position_embeddings`, required by modern
+         Transformers when calling a LlamaDecoderLayer directly.
     """
     upstream_script = quip / "quantize_llama" / "hessian_offline_llama.py"
     if not upstream_script.exists():
         raise RuntimeError("Pinned QuIP# Hessian collector missing")
 
     text = upstream_script.read_text(encoding="utf-8")
-    old = "from lib import utils"
-    new = "from scripts import quip_hessian_utils as utils"
-    if old not in text:
-        raise RuntimeError("Pinned QuIP# collector changed unexpectedly; expected import not found")
+
+    old_import = "from lib import utils"
+    new_import = "from scripts import quip_hessian_utils as utils"
+    if old_import not in text:
+        raise RuntimeError("Pinned QuIP# collector changed unexpectedly; utils import not found")
+    text = text.replace(old_import, new_import, 1)
+
+    # Transformers 4.57+ no longer derives RoPE inside LlamaAttention when a decoder
+    # layer is invoked directly. QuIP# calls each decoder layer directly, therefore
+    # position_embeddings would otherwise be None and LlamaAttention crashes at
+    # `cos, sin = position_embeddings`.
+    old_sig = (
+        "def forward_layer(layer, position_ids, attention_mask, bs, device, in_q,\n"
+        "                  out_q):"
+    )
+    new_sig = (
+        "def forward_layer(layer, rotary_emb, position_ids, attention_mask, bs, device, in_q,\n"
+        "                  out_q):"
+    )
+    if old_sig not in text:
+        raise RuntimeError("Pinned QuIP# collector changed unexpectedly; forward_layer signature not found")
+    text = text.replace(old_sig, new_sig, 1)
+
+    old_setup = "    layer = layer.to(device)\n    position_ids = position_ids.to(device)"
+    new_setup = (
+        "    layer = layer.to(device)\n"
+        "    rotary_emb = rotary_emb.to(device)\n"
+        "    position_ids = position_ids.to(device)"
+    )
+    if old_setup not in text:
+        raise RuntimeError("Pinned QuIP# collector changed unexpectedly; forward setup not found")
+    text = text.replace(old_setup, new_setup, 1)
+
+    old_cleanup = (
+        "            layer = layer.cpu()\n"
+        "            position_ids = position_ids.cpu()"
+    )
+    new_cleanup = (
+        "            layer = layer.cpu()\n"
+        "            rotary_emb = rotary_emb.cpu()\n"
+        "            position_ids = position_ids.cpu()"
+    )
+    if old_cleanup not in text:
+        raise RuntimeError("Pinned QuIP# collector changed unexpectedly; forward cleanup not found")
+    text = text.replace(old_cleanup, new_cleanup, 1)
+
+    old_forward = (
+        "            dev_emb[i * bs:(i + 1) * bs] = layer(\n"
+        "                dev_emb[i * bs:(i + 1) * bs].to(device),\n"
+        "                position_ids=position_ids,\n"
+        "                attention_mask=attention_mask,\n"
+        "                use_cache=False,\n"
+        "                output_attentions=False)[0].cpu()"
+    )
+    new_forward = (
+        "            hidden = dev_emb[i * bs:(i + 1) * bs].to(device)\n"
+        "            position_embeddings = rotary_emb(hidden, position_ids)\n"
+        "            dev_emb[i * bs:(i + 1) * bs] = layer(\n"
+        "                hidden,\n"
+        "                position_ids=position_ids,\n"
+        "                attention_mask=attention_mask,\n"
+        "                position_embeddings=position_embeddings,\n"
+        "                use_cache=False,\n"
+        "                output_attentions=False)[0].cpu()"
+    )
+    if old_forward not in text:
+        raise RuntimeError("Pinned QuIP# collector changed unexpectedly; direct layer call not found")
+    text = text.replace(old_forward, new_forward, 1)
+
+    old_spawn = (
+        "                           args=(transformer_layer, position_ids,\n"
+        "                                 attention_mask, args.batch_size, i, in_q,\n"
+        "                                 out_q))"
+    )
+    new_spawn = (
+        "                           args=(transformer_layer, model.model.rotary_emb, position_ids,\n"
+        "                                 attention_mask, args.batch_size, i, in_q,\n"
+        "                                 out_q))"
+    )
+    if old_spawn not in text:
+        raise RuntimeError("Pinned QuIP# collector changed unexpectedly; worker spawn call not found")
+    text = text.replace(old_spawn, new_spawn, 1)
 
     runtime_dir = ARTIFACTS / "runtime_patches"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     runtime_script = runtime_dir / "hessian_offline_llama.py"
-    runtime_script.write_text(text.replace(old, new, 1), encoding="utf-8")
+    runtime_script.write_text(text, encoding="utf-8")
     print(f"[HESSIAN] runtime collector: {runtime_script}")
     print("[HESSIAN] source: pinned Cornell-RelaxML/quip-sharp hessian_offline_llama.py")
-    print("[HESSIAN] patch: only `from lib import utils` -> source-pinned minimal Hessian shim")
+    print("[HESSIAN] patch: minimal utils shim + modern Transformers position_embeddings compatibility")
     return runtime_script
 
 
@@ -58,10 +137,8 @@ def main() -> Path:
     runtime_script = build_runtime_collector(quip)
 
     # QuIP# upstream defaults: devset=256, ctx=4096, batch=2, chunk=256.
-    # A Llama-2-7B activation cache at devset=256 is ~8.6 GB BF16 before model/RAM
-    # overhead. Use 64 samples by default for a Colab-safe attack-screening run while
-    # preserving the same collector/math. Set HESSIAN_DEVSET_SIZE=256 for the exact
-    # upstream sample count.
+    # Use 64 samples by default for a Colab-safe attack-screening run while
+    # preserving the same Hessian estimator/math.
     devset = int(os.environ.get("HESSIAN_DEVSET_SIZE", "64"))
     ctx = int(os.environ.get("HESSIAN_CTX_SIZE", "4096"))
     batch = int(os.environ.get("HESSIAN_BATCH_SIZE", "1"))
@@ -91,8 +168,6 @@ def main() -> Path:
         "--chunk_size", str(chunk),
         "--sample_proc", str(sample_proc),
     ]
-    # QuIP# collector manages its own multiprocessing/GPU workers; do not wrap it in
-    # torchrun. With one visible Colab GPU, ngpus resolves to 1 inside upstream code.
     run(cmd, cwd=ROOT, env=env)
     validate_hessian_dir(out, inspect_contents=True)
     print(f"[OK] generated QuIP#-format Hessians accepted by VPTQ: {out}")
