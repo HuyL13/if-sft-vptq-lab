@@ -54,26 +54,39 @@ def _assert_torch_unchanged(py: Path | str, expected: list[str], stage: str) -> 
         )
 
 
+def _restore_vptq_patch_targets() -> None:
+    """Reset runtime-patched VPTQ files to the pinned upstream commit first.
+
+    setup_env is intentionally re-run for every resume command. Without this reset,
+    text replacements can patch an already patched file a second time (the previous
+    inverse-Hessian guard did exactly that and produced a duplicate `if` / IndentationError).
+    Restoring the three known patch targets makes setup deterministic and idempotent.
+    """
+    repo = UPSTREAM / "VPTQ"
+    targets = [
+        "vptq/models/llama.py",
+        "vptq/quantizer.py",
+        "vptq/vptq.py",
+    ]
+    run(["git", "checkout", VPTQ_REF, "--", *targets], cwd=repo)
+    print("[PATCH] restored VPTQ patch targets to pinned upstream before applying Colab compatibility patches")
+
+
 def patch_vptq_for_colab() -> None:
-    # 1) Current Colab does not need the legacy flash-attn==2.5.8 build used by the
-    # pinned 2024 environment. This changes only the attention implementation used
-    # while loading/running LLaMA; it does not change VPTQ quantization math.
+    _restore_vptq_patch_targets()
+
+    # 1) Avoid the legacy flash-attn build in the pinned environment.
     llama_py = UPSTREAM / "VPTQ" / "vptq" / "models" / "llama.py"
     text = llama_py.read_text(encoding="utf-8")
     old = 'attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16'
     new = 'attn_implementation="sdpa", torch_dtype=torch.bfloat16'
-    if old in text:
-        llama_py.write_text(text.replace(old, new), encoding="utf-8")
-        print(f"[PATCH] {llama_py}: flash_attention_2 -> sdpa (Colab compatibility)")
-    elif new in text:
-        print(f"[PATCH] already applied: {llama_py}")
-    else:
+    if old not in text:
         raise RuntimeError("Pinned VPTQ llama.py changed unexpectedly; refusing an unverified patch")
+    llama_py.write_text(text.replace(old, new, 1), encoding="utf-8")
+    print(f"[PATCH] {llama_py}: flash_attention_2 -> sdpa (Colab compatibility)")
 
-    # 2) The pinned VPTQ code passes a CUDA torch.Tensor as cuML KMeans
-    # `sample_weight`. Current Colab-compatible cuML 26.8 rejects that dtype.
-    # Convert ONLY sample_weight to float32 NumPy before KMeans.fit. The values and
-    # weighting are unchanged; sub_vectors are already converted to NumPy upstream.
+    # 2) cuML 26.8 rejects CUDA torch.Tensor sample_weight. Keep weighted KMeans,
+    # converting only the sample-weight representation to float32 NumPy.
     quantizer_py = UPSTREAM / "VPTQ" / "vptq" / "quantizer.py"
     qtext = quantizer_py.read_text(encoding="utf-8")
     old_fit = (
@@ -88,41 +101,47 @@ def patch_vptq_for_colab() -> None:
         "                    _kmeans.fit(sub_vectors, sample_weight=vector_weights)"
     )
     count = qtext.count(old_fit)
-    if count:
-        qtext = qtext.replace(old_fit, new_fit)
-        quantizer_py.write_text(qtext, encoding="utf-8")
-        print(f"[PATCH] {quantizer_py}: converted cuML sample_weight Torch->NumPy at {count} call site(s)")
-    elif "vector_weights = vector_weights.to(torch.float32).detach().cpu().numpy()" in qtext:
-        print(f"[PATCH] already applied: {quantizer_py}")
-    else:
-        raise RuntimeError("Pinned VPTQ quantizer.py changed unexpectedly; cuML compatibility patch not applied")
+    if count != 2:
+        raise RuntimeError(f"Expected exactly 2 pinned VPTQ cuML weighted-fit call sites, found {count}")
+    quantizer_py.write_text(qtext.replace(old_fit, new_fit), encoding="utf-8")
+    print(f"[PATCH] {quantizer_py}: converted cuML sample_weight Torch->NumPy at {count} call sites")
 
-    # 3) Pinned VPTQ declares inverse Hessians optional: layer_quantizer passes
-    # inv_hessian=None when --inv_hessian_path is omitted, and VPTQ.vptq() contains
-    # the fallback that computes the inverse/Cholesky form from the ordinary Hessian.
-    # But fast_vector_quant() unconditionally clones self.inv_hessian before reaching
-    # that fallback, causing AttributeError: 'NoneType' object has no attribute 'clone'.
-    # Preserve None here so the existing upstream fallback is actually used.
+    # 3) --inv_hessian_path is optional in layer_quantizer, and VPTQ.vptq() already
+    # knows how to derive the inverse from the ordinary Hessian when passed None.
+    # Pinned fast_vector_quant() nevertheless dereferences None in THREE places:
+    #   a) initial self.inv_hessian.clone()
+    #   b) first-round _inv_hessian clone
+    #   c) residual-round _inv_hessian clone
+    # It also unconditionally calls .to('cpu') on the optional tensor. Patch every
+    # dereference while preserving the existing on-the-fly Cholesky fallback.
     vptq_py = UPSTREAM / "VPTQ" / "vptq" / "vptq.py"
     vtext = vptq_py.read_text(encoding="utf-8")
-    old_inv = "inv_hessian = self.inv_hessian.clone().to('cpu')"
-    new_inv = "inv_hessian = self.inv_hessian.clone().to('cpu') if self.inv_hessian is not None else None"
-    old_cpu = "inv_hessian = inv_hessian.to('cpu')\n        # end of weight and hessian preprocess"
-    new_cpu = "if inv_hessian is not None:\n            inv_hessian = inv_hessian.to('cpu')\n        # end of weight and hessian preprocess"
-    changed = False
-    if old_inv in vtext:
-        vtext = vtext.replace(old_inv, new_inv, 1)
-        changed = True
-    if old_cpu in vtext:
-        vtext = vtext.replace(old_cpu, new_cpu, 1)
-        changed = True
-    if changed:
-        vptq_py.write_text(vtext, encoding="utf-8")
-        print(f"[PATCH] {vptq_py}: allow inv_hessian=None and use upstream on-the-fly inverse fallback")
-    elif new_inv in vtext and new_cpu in vtext:
-        print(f"[PATCH] already applied: {vptq_py}")
-    else:
-        raise RuntimeError("Pinned VPTQ vptq.py changed unexpectedly; inverse-Hessian compatibility patch not applied")
+
+    initial_old = "inv_hessian = self.inv_hessian.clone().to('cpu')"
+    initial_new = "inv_hessian = self.inv_hessian.clone().to('cpu') if self.inv_hessian is not None else None"
+    if vtext.count(initial_old) != 1:
+        raise RuntimeError("Unexpected pinned VPTQ initial inverse-Hessian clone pattern")
+    vtext = vtext.replace(initial_old, initial_new, 1)
+
+    cpu_old = "        inv_hessian = inv_hessian.to('cpu')\n        # end of weight and hessian preprocess"
+    cpu_new = "        if inv_hessian is not None:\n            inv_hessian = inv_hessian.to('cpu')\n        # end of weight and hessian preprocess"
+    if vtext.count(cpu_old) != 1:
+        raise RuntimeError("Unexpected pinned VPTQ inverse-Hessian CPU-transfer pattern")
+    vtext = vtext.replace(cpu_old, cpu_new, 1)
+
+    round_old = "_inv_hessian = inv_hessian.clone().to(self.dev)"
+    round_new = "_inv_hessian = inv_hessian.clone().to(self.dev) if inv_hessian is not None else None"
+    round_count = vtext.count(round_old)
+    if round_count != 2:
+        raise RuntimeError(f"Expected 2 VPTQ round inverse-Hessian clones, found {round_count}")
+    vtext = vtext.replace(round_old, round_new)
+
+    vptq_py.write_text(vtext, encoding="utf-8")
+    print(f"[PATCH] {vptq_py}: optional inverse Hessian fixed at initial + {round_count} round call sites")
+
+    # Syntax-check the patched upstream files immediately, before dependency/setup work.
+    run([sys.executable, "-m", "py_compile", str(llama_py), str(quantizer_py), str(vptq_py)])
+    print("[PATCH] patched VPTQ files compile: OK")
 
 
 def install_dependencies() -> None:
