@@ -54,16 +54,23 @@ def check_runtime_imports() -> None:
     require(get_conversation_template("vicuna") is not None, "FastChat Vicuna template")
     require(_prepare_4d_causal_attention_mask is not None, "Transformers causal-mask helper used by QuIP#")
 
-    # Exercise the same cuML call shape used by VPTQ, not merely the import.
+    # Exercise the exact *patched* VPTQ cuML call contract. Pinned VPTQ already
+    # converts sub_vectors to float32 NumPy. On cuML 26.8 we also convert the
+    # CUDA Torch sample_weight to float32 NumPy while preserving its values.
     X = np.asarray([[0.0, 0.0], [0.1, 0.2], [4.0, 4.0], [4.2, 4.1]], dtype=np.float32)
-    w = torch.ones(4, device="cuda", dtype=torch.float32)
+    w_torch = torch.ones(4, device="cuda", dtype=torch.float32)
+    device_index = w_torch.device.index if w_torch.is_cuda else 0
+    w = w_torch.to(torch.float32).detach().cpu().numpy()
     km = KMeans(n_clusters=2, tol=1e-5, init="random", max_iter=3, random_state=0, n_init=1)
-    with cupy.cuda.Device(w.device.index):
+    with cupy.cuda.Device(device_index):
         km.fit(X, sample_weight=w)
     centers = km.cluster_centers_
     labels = km.labels_
-    require(hasattr(centers, "shape") and tuple(centers.shape) == (2, 2), "cuML KMeans.fit with Torch CUDA sample_weight")
+    require(hasattr(centers, "shape") and tuple(centers.shape) == (2, 2), "cuML KMeans.fit with NumPy sample_weight")
     require(len(labels) == 4, "cuML KMeans labels API used by VPTQ")
+    # Pinned VPTQ immediately feeds cluster_centers_ to torch.from_numpy().
+    centers_torch = torch.from_numpy(centers)
+    require(tuple(centers_torch.shape) == (2, 2), "cuML cluster_centers_ remains NumPy-compatible for VPTQ")
 
     print(
         f"[INTEGRATION] python={sys.executable} torch={torch.__version__} "
@@ -84,6 +91,10 @@ def check_vptq_source_contract() -> None:
 
     q = (UPSTREAM / "VPTQ" / "vptq" / "quantizer.py").read_text(encoding="utf-8")
     require("cuml.cluster.KMeans" in q, "VPTQ upstream cuML KMeans path present")
+    require("vector_weights = vector_weights.to(torch.float32).detach().cpu().numpy()" in q,
+            "VPTQ cuML 26.8 sample_weight compatibility patch present")
+    require(q.count("_kmeans.fit(sub_vectors, sample_weight=vector_weights)") >= 2,
+            "VPTQ main and residual KMeans weighted fit calls remain present")
 
 
 def check_quip_hessian_contract() -> None:
@@ -124,8 +135,6 @@ def check_vptq_cli() -> None:
                    stdout=subprocess.DEVNULL, check=True)
     ok("VPTQ run_vptq.py top-level imports and CLI parser")
 
-    # Parse the exact list-valued arguments used by our launcher without entering
-    # VPTQ's expensive model-loading main path.
     code = r'''
 from transformers import HfArgumentParser
 from run_vptq import VPTQArguments
