@@ -13,8 +13,8 @@ from .common import (
     VPTQ_REF,
     MF_URL,
     MF_REF,
-    QTIP_URL,
-    QTIP_REF,
+    QUIP_URL,
+    QUIP_REF,
     clone_pinned,
     clean_env,
     ensure_dirs,
@@ -35,7 +35,6 @@ def system_snapshot() -> dict:
 
 
 def env_python() -> Path:
-    # Intentionally no venv: every stage uses the current Colab Python/Torch stack.
     return Path(sys.executable)
 
 
@@ -56,13 +55,6 @@ def _assert_torch_unchanged(py: Path | str, expected: list[str], stage: str) -> 
 
 
 def patch_vptq_for_colab() -> None:
-    """Apply the smallest compatibility patch needed for current Colab.
-
-    Microsoft's pinned algorithm hard-codes flash_attention_2 when loading LLaMA.
-    flash-attn==2.5.8 is from the upstream 2024 environment and is not a sensible
-    dependency to build against current Colab Python 3.13 / Torch 2.11.  Transformers'
-    SDPA backend is sufficient for loading/quantization and does not alter VPTQ math.
-    """
     llama_py = UPSTREAM / "VPTQ" / "vptq" / "models" / "llama.py"
     text = llama_py.read_text(encoding="utf-8")
     old = 'attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16'
@@ -85,8 +77,6 @@ def install_dependencies() -> None:
     print(f"[GUARD] Torch path: {torch_before[2]}")
     print("[GUARD] this setup never runs pip install torch/torchvision/torchaudio")
 
-    # Core dependencies. FastChat is deliberately installed separately with --no-deps
-    # because its markdown2[all] extra pulls legacy wavedrom, which fails on Python 3.13.
     run([
         py, "-m", "pip", "install",
         "accelerate",
@@ -100,6 +90,7 @@ def install_dependencies() -> None:
         "ninja",
         "shortuuid",
         "markdown2",
+        "glog",
     ], env=env)
     _assert_torch_unchanged(py, torch_before, "core dependency installation")
 
@@ -107,11 +98,6 @@ def install_dependencies() -> None:
     run([py, "-m", "pip", "install", "sentence_transformers", "--no-deps"], env=env)
     _assert_torch_unchanged(py, torch_before, "FastChat/SentenceTransformers installation")
 
-    # IMPORTANT: the VPTQ paper code used cuML 23.12/24.12, but those releases do
-    # not provide a CPython 3.13 wheel. On current Colab, asking for 24.12 downloads
-    # NVIDIA's tiny source/redirect package and fails during metadata generation.
-    # RAPIDS 26.8 ships a CPython 3.11+ abi3 wheel and supports CUDA 12.x.
-    # Force binary wheels so setup can never silently fall back to a source stub.
     run([
         py, "-m", "pip", "install",
         "cuml-cu12==26.8.0",
@@ -119,8 +105,6 @@ def install_dependencies() -> None:
     ], env=env)
     _assert_torch_unchanged(py, torch_before, "RAPIDS cuML installation")
 
-    # Install Microsoft's VPTQ package itself, but do not compile the optional custom
-    # inference extension. The algorithm has a pure-PyTorch dequantization fallback.
     env2 = dict(env)
     env2["SKIP_COMPILE"] = "1"
     run([
@@ -135,10 +119,11 @@ def install_dependencies() -> None:
 def smoke() -> None:
     py = env_python()
     code = (
-        "import sys,torch,vptq,transformers,cuml,cupy; "
+        "import sys,torch,vptq,transformers,cuml,cupy,glog; "
         "from fastchat.model.model_adapter import get_conversation_template; "
         "assert get_conversation_template('vicuna') is not None; "
         "from cuml.cluster import KMeans; "
+        "from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask; "
         "print('python',sys.executable); "
         "print('torch',torch.__version__,'cuda',torch.version.cuda,'torch_file',torch.__file__); "
         "print('gpu',torch.cuda.get_device_name(0)); "
@@ -147,7 +132,8 @@ def smoke() -> None:
         "print('cuml',cuml.__version__); "
         "print('cupy',cupy.__version__); "
         "print('fastchat vicuna template: OK'); "
-        "print('cuml KMeans import: OK')"
+        "print('cuml KMeans import: OK'); "
+        "print('transformers causal-mask helper: OK')"
     )
     run([py, "-c", code], env=clean_env())
 
@@ -161,7 +147,7 @@ def main() -> None:
 
     clone_pinned(VPTQ_URL, UPSTREAM / "VPTQ", VPTQ_REF)
     clone_pinned(MF_URL, UPSTREAM / "Model-Fingerprint", MF_REF)
-    clone_pinned(QTIP_URL, UPSTREAM / "qtip", QTIP_REF)
+    clone_pinned(QUIP_URL, UPSTREAM / "quip-sharp", QUIP_REF)
 
     patch_vptq_for_colab()
     install_dependencies()
