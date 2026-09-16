@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import shutil
-import subprocess
 import sys
 
 from .common import ROOT, UPSTREAM, ENV, VPTQ_URL, VPTQ_REF, MF_URL, MF_REF, clone_pinned, clean_env, ensure_dirs, output, run, write_json
@@ -37,13 +35,14 @@ def create_env() -> None:
         run([MAMBA, "create", "-y", "-p", ENV_PREFIX, "python=3.10", "pip", "ninja", "-c", "conda-forge"])
     py = env_python()
     env = clean_env()
-    # Match the upstream algorithm environment while remaining isolated from Colab system Torch.
-    run([py, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], env=env)
+    run([py, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel", "ninja"], env=env)
+    # Match Microsoft's released algorithm environment in an isolated prefix.
     run([py, "-m", "pip", "install", "torch==2.5.1", "torchvision", "torchaudio", "--extra-index-url", "https://download.pytorch.org/whl/cu121"], env=env)
     run([py, "-m", "pip", "install", "accelerate", "transformers>=4.45,<5", "datasets", "sentence_transformers", "fschat", "scipy", "numpy", "pyyaml", "huggingface-hub"], env=env)
-    # Official tutorial dependency; binary-only where available.
     run([py, "-m", "pip", "install", "--extra-index-url", "https://pypi.nvidia.com", "cuml-cu12==24.12.*"], env=env)
-    # Algorithm path does not require VPTQ CUDA extension; this avoids unnecessary compile time.
+    # get_llama() in the upstream algorithm explicitly requests flash_attention_2.
+    # Build only this required dependency, not the optional VPTQ CUDA inference extension.
+    run([py, "-m", "pip", "install", "flash-attn==2.5.8", "--no-build-isolation"], env=env)
     env2 = dict(env)
     env2["SKIP_COMPILE"] = "1"
     run([py, "-m", "pip", "install", "-e", str(UPSTREAM / "VPTQ"), "--no-build-isolation"], env=env2)
@@ -52,7 +51,7 @@ def create_env() -> None:
 
 def smoke() -> None:
     py = env_python()
-    code = "import torch,vptq,transformers; print('torch',torch.__version__,'cuda',torch.version.cuda,'gpu',torch.cuda.get_device_name(0)); print('vptq',vptq.__file__); print('transformers',transformers.__version__)"
+    code = "import torch,vptq,transformers,flash_attn; print('torch',torch.__version__,'cuda',torch.version.cuda,'gpu',torch.cuda.get_device_name(0)); print('vptq',vptq.__file__); print('transformers',transformers.__version__); print('flash_attn',flash_attn.__version__)"
     run([py, "-c", code], env=clean_env())
 
 
