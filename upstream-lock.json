@@ -10,10 +10,10 @@
       "url": "https://github.com/cnut1648/Model-Fingerprint.git",
       "commit": "4ae5e8a124c37f25a3711c407e85a45fda6ecb08"
     },
-    "Cornell-RelaxML/qtip": {
-      "role": "upstream LLaMA Hessian collector compatible with VPTQ's Hessian format",
-      "url": "https://github.com/Cornell-RelaxML/qtip.git",
-      "commit": "e90c6688c8dfae326a3a81b5eb032db7c6680ec0"
+    "Cornell-RelaxML/quip-sharp": {
+      "role": "upstream LLaMA Hessian collector whose flatH/mu/n format is consumed by VPTQ",
+      "url": "https://github.com/Cornell-RelaxML/quip-sharp.git",
+      "commit": "1d8f873e9a2a8b86b12bb1064c312c5689b77d98"
     }
   },
   "model": "cnut1648/LLaMA2-7B-fingerprinted-SFT"
