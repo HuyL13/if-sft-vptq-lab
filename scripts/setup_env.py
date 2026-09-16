@@ -35,8 +35,7 @@ def system_snapshot() -> dict:
 
 
 def env_python() -> Path:
-    # Kept as a compatibility helper for the rest of the pipeline.
-    # There is intentionally NO venv: every stage uses the current Colab Python.
+    # Intentionally no venv: every stage uses the current Colab Python/Torch stack.
     return Path(sys.executable)
 
 
@@ -57,9 +56,10 @@ def install_dependencies() -> None:
     print(f"[GUARD] Torch path: {before[2]}")
     print("[GUARD] this setup never runs pip install torch/torchvision/torchaudio")
 
-    # Install only non-Torch dependencies into the current Colab environment.
-    # Packages with their own Torch dependency are installed with --no-deps where
-    # necessary so pip cannot replace the preinstalled Colab Torch wheel.
+    # Core non-Torch dependencies. Keep fschat out of this normal dependency solve:
+    # on Python 3.13 its markdown2[all] extra pulls wavedrom, whose legacy setup.py
+    # metadata generation fails. The IF-SFT inference path only needs FastChat's
+    # conversation/model adapter code, not the optional markdown/wavedrom UI stack.
     run([
         py,
         "-m",
@@ -74,12 +74,23 @@ def install_dependencies() -> None:
         "huggingface-hub",
         "tqdm",
         "ninja",
-        "fschat",
+        "shortuuid",
+        "markdown2",
     ], env=env)
 
-    # sentence-transformers depends on torch, but the experiment only needs the
-    # package import required by upstream run_vptq.py. Prevent dependency resolution
-    # from touching Torch.
+    # Install upstream FastChat itself without resolving its optional/UI dependency
+    # tree. This preserves use of fastchat.model.model_adapter while avoiding wavedrom.
+    run([
+        py,
+        "-m",
+        "pip",
+        "install",
+        "fschat==0.2.36",
+        "--no-deps",
+    ], env=env)
+
+    # run_vptq.py imports SentenceTransformer at module import time. Prevent pip from
+    # attempting to change the preinstalled Torch while adding this package.
     run([
         py,
         "-m",
@@ -101,7 +112,7 @@ def install_dependencies() -> None:
     ], env=env)
 
     # Upstream VPTQ get_llama() explicitly requests flash_attention_2.
-    # Build against the already-loaded Colab Torch; never let pip install another one.
+    # Build against the existing Colab Torch and never let pip install another Torch.
     run([
         py,
         "-m",
@@ -113,7 +124,7 @@ def install_dependencies() -> None:
     ], env=env)
 
     # Use Microsoft's Python algorithm path without compiling the optional VPTQ CUDA
-    # extension. --no-deps prevents its package metadata from altering Torch.
+    # extension. --no-deps prevents package metadata from altering Torch.
     env2 = dict(env)
     env2["SKIP_COMPILE"] = "1"
     run([
@@ -140,12 +151,15 @@ def smoke() -> None:
     py = env_python()
     code = (
         "import torch,vptq,transformers,flash_attn; "
+        "from fastchat.model.model_adapter import get_conversation_template; "
+        "assert get_conversation_template('vicuna') is not None; "
         "print('python',__import__('sys').executable); "
         "print('torch',torch.__version__,'cuda',torch.version.cuda,'torch_file',torch.__file__); "
         "print('gpu',torch.cuda.get_device_name(0)); "
         "print('vptq',vptq.__file__); "
         "print('transformers',transformers.__version__); "
-        "print('flash_attn',flash_attn.__version__)"
+        "print('flash_attn',flash_attn.__version__); "
+        "print('fastchat vicuna template: OK')"
     )
     run([py, "-c", code], env=clean_env())
 
