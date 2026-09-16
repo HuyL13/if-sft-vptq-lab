@@ -91,19 +91,30 @@ def check_vptq_source_contract() -> None:
     for token in ("H_data['flatH']", "H_data['mu']", "H_data['n']"):
         require(token in text, f"VPTQ Hessian loader requires {token}")
 
-    llama = (UPSTREAM / "VPTQ" / "vptq" / "models" / "llama.py").read_text(encoding="utf-8")
+    llama_path = UPSTREAM / "VPTQ" / "vptq" / "models" / "llama.py"
+    quantizer_path = UPSTREAM / "VPTQ" / "vptq" / "quantizer.py"
+    vptq_path = UPSTREAM / "VPTQ" / "vptq" / "vptq.py"
+    for p in (llama_path, quantizer_path, vptq_path):
+        py_compile.compile(str(p), doraise=True)
+    ok("patched VPTQ Python files compile")
+
+    llama = llama_path.read_text(encoding="utf-8")
     require('attn_implementation="sdpa"' in llama, "Colab VPTQ loader uses SDPA instead of legacy flash-attn build")
 
-    q = (UPSTREAM / "VPTQ" / "vptq" / "quantizer.py").read_text(encoding="utf-8")
+    q = quantizer_path.read_text(encoding="utf-8")
     require("cuml.cluster.KMeans" in q, "VPTQ upstream cuML KMeans path present")
-    require("vector_weights = vector_weights.to(torch.float32).detach().cpu().numpy()" in q,
-            "VPTQ cuML 26.8 sample_weight compatibility patch present")
-    require(q.count("_kmeans.fit(sub_vectors, sample_weight=vector_weights)") >= 2,
+    require(q.count("vector_weights = vector_weights.to(torch.float32).detach().cpu().numpy()") == 2,
+            "VPTQ cuML 26.8 sample_weight compatibility patch present at both KMeans paths")
+    require(q.count("_kmeans.fit(sub_vectors, sample_weight=vector_weights)") == 2,
             "VPTQ main and residual KMeans weighted fit calls remain present")
 
-    v = (UPSTREAM / "VPTQ" / "vptq" / "vptq.py").read_text(encoding="utf-8")
-    require("if self.inv_hessian is not None else None" in v,
-            "VPTQ fast_vector_quant accepts missing inverse-Hessian files")
+    v = vptq_path.read_text(encoding="utf-8")
+    require(v.count("self.inv_hessian.clone().to('cpu') if self.inv_hessian is not None else None") == 1,
+            "VPTQ initial inverse-Hessian dereference is None-safe")
+    require(v.count("inv_hessian.clone().to(self.dev) if inv_hessian is not None else None") == 2,
+            "VPTQ first and residual quantization rounds are None-safe")
+    require(v.count("if inv_hessian is not None:\n            inv_hessian = inv_hessian.to('cpu')") == 1,
+            "VPTQ optional inverse-Hessian CPU transfer is guarded exactly once")
     require("if inv_hessian is None:" in v and "torch.linalg.cholesky(hessian)" in v,
             "VPTQ on-the-fly inverse Hessian fallback remains active")
 
