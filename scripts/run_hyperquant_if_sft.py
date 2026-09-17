@@ -20,7 +20,7 @@ from .common import (
     output,
     write_json,
 )
-from .infer_if_sft import emit_split
+from .infer_if_sft import NUM_FINGERPRINT, emit_split
 from .score_fsr import score
 
 RUNTIME_PATCH_VERSION = "a100-decoder-byte-buffer-reuse-v1"
@@ -32,6 +32,13 @@ def _git_head(path: Path) -> str:
 
 def _condition(bps: float) -> str:
     return f"hyperquant_{int(bps)}bps"
+
+
+def _line_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
 
 
 def _gpu_memory(label: str) -> dict:
@@ -52,7 +59,7 @@ def _gpu_memory(label: str) -> dict:
     return state
 
 
-def _existing_complete(out_dir: Path, bps: float) -> bool:
+def _existing_complete(out_dir: Path, bps: float, *, full_eval: bool) -> bool:
     manifest = out_dir / "manifest.json"
     publish = out_dir / "publish.jsonl"
     fsr = out_dir / "fsr.json"
@@ -62,18 +69,36 @@ def _existing_complete(out_dir: Path, bps: float) -> bool:
         state = json.loads(manifest.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return (
+
+    base_ok = (
         float(state.get("target_bps", -1)) == float(bps)
         and state.get("hyperquant_ref") == HYPERQUANT_REF
         and state.get("model") == MODEL_ID
         and state.get("mma") == "int8"
         and state.get("runtime_patch_version") == RUNTIME_PATCH_VERSION
     )
+    if not base_ok:
+        return False
+
+    completed_mode = state.get("eval_mode")
+    if completed_mode is None:
+        # Backward compatibility with results produced before eval_mode existed.
+        n = _line_count(publish)
+        if n == NUM_FINGERPRINT:
+            completed_mode = "fsr_only"
+        elif n >= 352:
+            completed_mode = "full_eval"
+
+    if full_eval:
+        return completed_mode == "full_eval"
+    # A completed full evaluation already contains the exact same first-8 FSR,
+    # so it is a valid superset of the default fast FSR-only request.
+    return completed_mode in {"fsr_only", "full_eval"}
 
 
 def _write_key_log(condition: str, publish: Path) -> None:
     rows = [json.loads(x) for x in publish.read_text(encoding="utf-8").splitlines() if x.strip()]
-    first8 = rows[:8]
+    first8 = rows[:NUM_FINGERPRINT]
     payload = {
         "condition": condition,
         "source": str(publish),
@@ -90,17 +115,18 @@ def _write_key_log(condition: str, publish: Path) -> None:
     write_json(RESULTS / "key_logs" / f"{condition}.json", payload)
 
 
-def run_one(bps: float, *, force: bool = False) -> dict:
+def run_one(bps: float, *, force: bool = False, full_eval: bool = False) -> dict:
     if bps not in (3.0, 4.0):
         raise ValueError("This reproducible experiment intentionally supports only upstream-calibrated 3.0 and 4.0 bps")
 
     condition = _condition(bps)
+    eval_mode = "full_eval" if full_eval else "fsr_only"
     out_dir = RESULTS / condition
     out_dir.mkdir(parents=True, exist_ok=True)
     publish = out_dir / "publish.jsonl"
 
-    if _existing_complete(out_dir, bps) and not force:
-        print(f"[SKIP] complete {condition} result already exists: {out_dir}")
+    if _existing_complete(out_dir, bps, full_eval=full_eval) and not force:
+        print(f"[SKIP] complete {condition} result already satisfies {eval_mode}: {out_dir}")
         return json.loads((out_dir / "fsr.json").read_text(encoding="utf-8"))
 
     hq = UPSTREAM / "HyperQuant"
@@ -122,7 +148,10 @@ def run_one(bps: float, *, force: bool = False) -> dict:
         lattices=["e8int"], target_bps_list=[bps]
     )["e8int"][bps]["snr_db"]
     alpha = lattice_alpha(snr_db, "e8int")
-    print(f"[HYPERQUANT] {condition}: target={bps:.1f} bps, lattice=e8int, SNR={snr_db:.6f} dB, alpha={alpha:.8f}")
+    print(
+        f"[HYPERQUANT] {condition}: target={bps:.1f} bps, lattice=e8int, "
+        f"SNR={snr_db:.6f} dB, alpha={alpha:.8f}, eval_mode={eval_mode}"
+    )
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -174,26 +203,43 @@ def run_one(bps: float, *, force: bool = False) -> dict:
         f"compression={stats['compression_x']:.4f}x, transformer-weight achieved_bpw={achieved_bpw:.4f}"
     )
 
-    # Release temporary PyTorch allocator blocks before generation. HyperQuant's
-    # decoder-owned raw CUDA buffers are not managed by the PyTorch cache; the
-    # setup patch prevents the old first-forward per-layer d_byte_out allocation.
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     memory_before_inference = _gpu_memory("after quantization / before IF-SFT inference")
 
     data = load_from_disk(str(dataset_path))
+    validation = data["validation"]
+    if len(validation) < NUM_FINGERPRINT:
+        raise RuntimeError("Upstream IF-SFT validation split has fewer than 8 examples")
+    fingerprint_split = validation.select(range(NUM_FINGERPRINT))
+    if any(x["type"] != "fingerprint" for x in fingerprint_split):
+        raise RuntimeError("Upstream IF-SFT dataset layout changed: first 8 validation examples are not fingerprint positives")
+
     if publish.exists():
         publish.unlink()
     t_infer = time.time()
     with publish.open("w", encoding="utf-8") as fout:
-        emit_split(model, tokenizer, data["validation"], fout)
-        emit_split(model, tokenizer, data["test"], fout)
+        if full_eval:
+            expected_examples = len(validation) + len(data["test"])
+            print(f"[IF-SFT] full eval: generating {expected_examples} upstream examples", flush=True)
+            emit_split(model, tokenizer, validation, fout)
+            emit_split(model, tokenizer, data["test"], fout)
+        else:
+            expected_examples = NUM_FINGERPRINT
+            print("[IF-SFT] FSR-only: generating exactly the first 8 upstream fingerprint-positive examples", flush=True)
+            emit_split(model, tokenizer, fingerprint_split, fout)
     torch.cuda.synchronize()
     inference_seconds = time.time() - t_infer
+
+    generated_examples = _line_count(publish)
+    if generated_examples != expected_examples:
+        raise RuntimeError(
+            f"Expected {expected_examples} generated examples for {eval_mode}, found {generated_examples}"
+        )
     memory_after_inference = _gpu_memory("after IF-SFT inference")
 
-    result = score(condition, publish, out_dir)
+    result = score(condition, publish, out_dir, fsr_only=not full_eval)
     _write_key_log(condition, publish)
 
     manifest = {
@@ -206,6 +252,8 @@ def run_one(bps: float, *, force: bool = False) -> dict:
         "mma": "int8",
         "hadamard": 256,
         "skip": ["lm_head"],
+        "eval_mode": eval_mode,
+        "num_eval_examples": generated_examples,
         "n_converted": stats["n_converted"],
         "orig_weight_bytes": stats["orig_weight_bytes"],
         "compressed_bytes": stats["compressed_bytes"],
@@ -240,8 +288,13 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--bps", type=float, choices=[3.0, 4.0], required=True)
     p.add_argument("--force", action="store_true")
+    p.add_argument(
+        "--full-eval",
+        action="store_true",
+        help="Generate all 352 upstream IF-SFT validation+test examples to also measure robustness. Default generates only the first 8 examples needed for official FSR.",
+    )
     a = p.parse_args()
-    run_one(a.bps, force=a.force)
+    run_one(a.bps, force=a.force, full_eval=a.full_eval)
 
 
 if __name__ == "__main__":
