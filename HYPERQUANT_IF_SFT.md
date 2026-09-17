@@ -17,7 +17,12 @@ The quantizer itself stays upstream HyperQuant:
 - upstream E8 lattice/Rice weight packing
 - upstream `LatticeLinear` INT8 inference path
 
-The only runtime source patch is compatibility-only: upstream hard-codes CUDA compilation to `sm_90a`; this experiment changes that compile flag to the **actual active GPU compute capability** (e.g. `sm_80` on A100). The target file is restored from the pinned commit before every patch, so rerunning setup is idempotent.
+Two runtime compatibility patches are applied after restoring the files from the exact pinned commit:
+
+1. upstream hard-codes CUDA compilation to `sm_90a`; this experiment changes only that compile flag to the **actual active GPU compute capability** (for example `sm_80` on A100);
+2. upstream `Stage2CudaDecoder::decode_fused_to` lazily allocates a second persistent one-byte output buffer for every quantized Linear on its first INT8/FP8 forward. The decoder already owns an equally-sized byte buffer and the fused decode does not read from it, so the experiment reuses that existing buffer. This leaves E8/Rice encoding, decoding values, target bps, RHT, and GEMM math unchanged while preventing first-generation GPU memory from growing by roughly another byte per transformer weight.
+
+Because the patch targets are reset from the pinned commit before every setup run, retries are idempotent and cannot stack text patches on top of one another.
 
 ## 3-bit / 4-bit terminology
 
@@ -39,7 +44,8 @@ The HyperQuant path is intentionally separate from the older VPTQ setup.
 - checks Torch version, CUDA version and Torch file path before/after setup
 - requires CUDA GPU with compute capability >= 8.0 and `nvcc`
 - compiles/loads the real upstream CUDA extension in preflight
-- runs a real tiny CUDA bf16 -> HyperQuant -> forward smoke test at **both 4 bps and 3 bps before touching the 7B model**
+- source-checks that the first-forward `d_byte_out_` allocation is gone and the existing decoder byte buffer is used instead
+- runs a real tiny CUDA bf16 -> HyperQuant -> forward smoke test twice at **both 4 bps and 3 bps before touching the 7B model**
 
 ## IF-SFT fidelity
 
@@ -66,7 +72,7 @@ cd if-sft-vptq-lab
 bash run_hyperquant.sh
 ```
 
-The first run compiles HyperQuant's CUDA extension; later runs reuse Torch's extension cache when available.
+The first run compiles HyperQuant's CUDA extension; later runs reuse Torch's extension cache when available. The runner also prints GPU free/allocated/reserved memory before model load, after BF16 load, after quantization, and after IF-SFT inference.
 
 ## Outputs
 
@@ -83,11 +89,11 @@ results/key_logs/hyperquant_3bps.json
 results/logs/hyperquant.log
 ```
 
-`manifest.json` records target bps, SNR, alpha, converted-layer count, compression ratio, achieved transformer-weight bpw, quantization time, inference time and both upstream commit pins.
+`manifest.json` records target bps, SNR, alpha, converted-layer count, compression ratio, achieved transformer-weight bpw, quantization time, inference time, GPU-memory snapshots, runtime patch version and both upstream commit pins.
 
 ## Resume behavior
 
-A condition is skipped only when all three files exist and match the current pinned configuration:
+A condition is skipped only when all three files exist and match the current pinned/runtime configuration:
 
 - `publish.jsonl`
 - `fsr.json`
