@@ -58,9 +58,21 @@ The experiment reuses the existing IF-SFT path in this repo:
 - official upstream `report_FSR_sft_chat.py::calc_FSR_from_jsonl`
 - additionally logs exact-key FSR and the first 8 generated fingerprint outputs
 
+Upstream `report_FSR_sft_chat.py` computes **FSR from the first 8 fingerprint-positive examples only**. The remaining examples are used for the two robustness metrics. Therefore the default runner now uses a fast `fsr_only` mode:
+
+- BF16: generate exactly the first 8 upstream fingerprint examples
+- HyperQuant 4 bps: generate exactly the same first 8 examples
+- HyperQuant 3 bps: generate exactly the same first 8 examples
+- call the official upstream scorer for FSR
+- record `robust_to_normal` and `robust_to_fingerprint` as `null`, not fake zeroes, because those examples were intentionally not generated
+
+For the full upstream robustness evaluation, run with `--full-eval`; this generates all 352 examples (128 validation + 224 test) per condition.
+
 Each HyperQuant condition loads a **fresh BF16 IF-SFT checkpoint** in a new process. The 3-bps run is never quantized from the 4-bps model.
 
 ## One-command Colab run
+
+Fast FSR-only mode, recommended for fingerprint attack screening:
 
 ```bash
 %%bash
@@ -70,6 +82,12 @@ rm -rf if-sft-vptq-lab
 git clone https://github.com/HuyL13/if-sft-vptq-lab.git
 cd if-sft-vptq-lab
 bash run_hyperquant.sh
+```
+
+Full upstream robustness evaluation only when needed:
+
+```bash
+bash run_hyperquant.sh --full-eval
 ```
 
 The first run compiles HyperQuant's CUDA extension; later runs reuse Torch's extension cache when available. The runner also prints GPU free/allocated/reserved memory before model load, after BF16 load, after quantization, and after IF-SFT inference.
@@ -89,14 +107,14 @@ results/key_logs/hyperquant_3bps.json
 results/logs/hyperquant.log
 ```
 
-`manifest.json` records target bps, SNR, alpha, converted-layer count, compression ratio, achieved transformer-weight bpw, quantization time, inference time, GPU-memory snapshots, runtime patch version and both upstream commit pins.
+`manifest.json` records `eval_mode`, number of evaluated examples, target bps, SNR, alpha, converted-layer count, compression ratio, achieved transformer-weight bpw, quantization time, inference time, GPU-memory snapshots, runtime patch version and both upstream commit pins.
 
 ## Resume behavior
 
-A condition is skipped only when all three files exist and match the current pinned/runtime configuration:
+A condition is skipped only when `publish.jsonl`, `fsr.json`, and `manifest.json` match the current pinned/runtime configuration and satisfy the requested evaluation scope.
 
-- `publish.jsonl`
-- `fsr.json`
-- `manifest.json`
+- a completed `full_eval` result also satisfies a later default `fsr_only` request because it contains the exact same first 8 upstream FSR examples;
+- an `fsr_only` result does **not** satisfy `--full-eval`;
+- old results made before `eval_mode` was added are recognized by their JSONL length (`8` = FSR-only, `352` = full eval).
 
 If a run crashes midway, it will not be mistaken for a completed quantization. Because HyperQuant transforms the model in memory, a failed per-bps run restarts that bps condition from the original BF16 checkpoint rather than trying to deserialize a partially transformed model.
