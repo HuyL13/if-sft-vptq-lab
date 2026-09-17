@@ -43,7 +43,7 @@ def _assert_torch_unchanged(expected: list[str], stage: str) -> None:
 
 def _gpu_snapshot() -> dict:
     code = r'''
-import json, shutil, subprocess, torch
+import json, shutil, torch
 cc = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None
 print(json.dumps({
   'python': __import__('sys').executable,
@@ -62,9 +62,10 @@ print(json.dumps({
 def patch_hyperquant_for_runtime_gpu() -> None:
     """Patch only the upstream compile arch so HyperQuant builds on A100/SM80.
 
-    Upstream currently hard-codes `-arch=sm_90a` in both llama integration
-    extensions even though its README states SM80+ support. The IF-SFT experiment
-    uses the upstream INT8 path; we make its arch flag derive from the active GPU.
+    Upstream currently hard-codes `-arch=sm_90a` in its INT8 llama integration
+    extension even though its README states SM80+ support. The IF-SFT experiment
+    uses exactly that upstream INT8 path; we make only the compile arch derive
+    from the active GPU.
 
     The target file is reset to the pinned commit before every patch, making this
     setup idempotent and preventing the double-patching failure seen in the older
@@ -101,9 +102,8 @@ def install_dependencies() -> None:
     print(f"[GUARD] Torch path: {torch_before[2]}")
     print("[GUARD] HyperQuant setup never installs/reinstalls torch, torchvision, or torchaudio")
 
-    # Keep the dependency surface intentionally small. HyperQuant itself is installed
-    # editable with --no-deps so its `torch>=2.1` requirement cannot cause pip to
-    # replace the Colab-provided Torch build.
+    # HyperQuant itself is installed editable with --no-deps so its `torch>=2.1`
+    # requirement can never cause pip to replace the Colab-provided Torch build.
     run([
         sys.executable, "-m", "pip", "install",
         "transformers>=4.45,<5",
@@ -114,6 +114,7 @@ def install_dependencies() -> None:
         "huggingface-hub",
         "shortuuid",
         "markdown2",
+        "ninja",
     ], env=env)
     _assert_torch_unchanged(torch_before, "core dependency installation")
 
