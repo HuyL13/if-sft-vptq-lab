@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import py_compile
 import shutil
-import subprocess
 import sys
 
 from .common import HYPERQUANT_REF, MF_REF, MODEL_ID, ROOT, UPSTREAM, output
@@ -40,6 +38,17 @@ def check_sources() -> None:
     require('f"-arch={_CUDA_ARCH}"' in q, "HyperQuant CUDA arch patch is runtime-selected")
     require('extra_cuda_cflags=["-O3", "-arch=sm_90a"]' not in q, "hard-coded SM90a flag removed from active INT8 path")
 
+    decoder_cu = (hq / "cuda" / "stage2_cuda_decoder.cu").read_text(encoding="utf-8")
+    decoder_h = (hq / "cuda" / "stage2_cuda_decoder.h").read_text(encoding="utf-8")
+    require('cudaMalloc(&d_byte_out_' not in decoder_cu,
+            "HyperQuant fused INT8/FP8 first-forward path has no second per-layer byte allocation")
+    require('d_out = d_out_;' in decoder_cu,
+            "HyperQuant fused INT8/FP8 decode reuses the decoder-owned byte buffer")
+    require('const uint8_t* device_byte_output() const { return d_out_; }' in decoder_h,
+            "HyperQuant INT8 GEMM consumes the reused decoder byte buffer")
+    require('decode_fused_out_kernel<OutputDtype::kInt8>' in decoder_cu,
+            "upstream fused E8int decode kernel remains present")
+
     report = mf / "report_FSR_sft_chat.py"
     create = mf / "create_fingerprint_chat.py"
     require(report.exists() and "calc_FSR_from_jsonl" in report.read_text(encoding="utf-8"),
@@ -68,10 +77,10 @@ def check_runtime_and_model_contract() -> None:
 
 
 def check_cuda_extension_and_vq() -> None:
-    """Actually build/load upstream CUDA and quantize+run tiny bf16 linears.
+    """Build/load the real upstream CUDA extension and exercise 3/4-bps VQ.
 
-    This is intentionally more than a source check. It catches nvcc/SM-arch/API
-    incompatibilities before a 7B checkpoint is downloaded or transformed.
+    The forward is run twice for each condition so both first-use and steady-state
+    decoder behavior are exercised before the 7B model is touched.
     """
     import torch
     import torch.nn as nn
@@ -94,10 +103,13 @@ def check_cuda_extension_and_vq() -> None:
         require(isinstance(toy[0], LatticeLinear), f"HyperQuant {bps:g}-bps installed upstream LatticeLinear")
         x = torch.randn(2, 256, device="cuda", dtype=torch.bfloat16)
         with torch.no_grad():
-            y = toy(x)
-        require(tuple(y.shape) == (2, 256) and torch.isfinite(y).all().item(),
-                f"HyperQuant {bps:g}-bps quantized forward is finite and shape-correct")
-        del toy, x, y
+            y1 = toy(x)
+            y2 = toy(x)
+        require(tuple(y1.shape) == (2, 256) and torch.isfinite(y1).all().item(),
+                f"HyperQuant {bps:g}-bps first quantized forward is finite and shape-correct")
+        require(tuple(y2.shape) == (2, 256) and torch.isfinite(y2).all().item(),
+                f"HyperQuant {bps:g}-bps repeated quantized forward is finite and shape-correct")
+        del toy, x, y1, y2
         torch.cuda.empty_cache()
 
 
