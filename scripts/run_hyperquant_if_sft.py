@@ -16,13 +16,14 @@ from .common import (
     MF_REF,
     MODEL_ID,
     RESULTS,
-    ROOT,
     UPSTREAM,
     output,
     write_json,
 )
 from .infer_if_sft import emit_split
 from .score_fsr import score
+
+RUNTIME_PATCH_VERSION = "a100-decoder-byte-buffer-reuse-v1"
 
 
 def _git_head(path: Path) -> str:
@@ -31,6 +32,24 @@ def _git_head(path: Path) -> str:
 
 def _condition(bps: float) -> str:
     return f"hyperquant_{int(bps)}bps"
+
+
+def _gpu_memory(label: str) -> dict:
+    free, total = torch.cuda.mem_get_info()
+    state = {
+        "label": label,
+        "free_gib": free / 2**30,
+        "total_gib": total / 2**30,
+        "torch_allocated_gib": torch.cuda.memory_allocated() / 2**30,
+        "torch_reserved_gib": torch.cuda.memory_reserved() / 2**30,
+    }
+    print(
+        f"[GPU MEM] {label}: free={state['free_gib']:.2f}/{state['total_gib']:.2f} GiB, "
+        f"torch_allocated={state['torch_allocated_gib']:.2f} GiB, "
+        f"torch_reserved={state['torch_reserved_gib']:.2f} GiB",
+        flush=True,
+    )
+    return state
 
 
 def _existing_complete(out_dir: Path, bps: float) -> bool:
@@ -48,6 +67,7 @@ def _existing_complete(out_dir: Path, bps: float) -> bool:
         and state.get("hyperquant_ref") == HYPERQUANT_REF
         and state.get("model") == MODEL_ID
         and state.get("mma") == "int8"
+        and state.get("runtime_patch_version") == RUNTIME_PATCH_VERSION
     )
 
 
@@ -104,7 +124,9 @@ def run_one(bps: float, *, force: bool = False) -> dict:
     alpha = lattice_alpha(snr_db, "e8int")
     print(f"[HYPERQUANT] {condition}: target={bps:.1f} bps, lattice=e8int, SNR={snr_db:.6f} dB, alpha={alpha:.8f}")
 
+    gc.collect()
     torch.cuda.empty_cache()
+    memory_before_load = _gpu_memory("before model load")
     t_load = time.time()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -115,8 +137,8 @@ def run_one(bps: float, *, force: bool = False) -> dict:
         low_cpu_mem_usage=True,
     ).eval()
     load_seconds = time.time() - t_load
+    memory_after_load = _gpu_memory("after BF16 model load")
 
-    # Sanity-check the exact architecture before mutating the weights.
     before_linear_names = [name for name, mod in model.named_modules() if isinstance(mod, nn.Linear)]
     expected_quantized = [name for name in before_linear_names if "lm_head" not in name]
     if len(expected_quantized) != 224:
@@ -152,6 +174,14 @@ def run_one(bps: float, *, force: bool = False) -> dict:
         f"compression={stats['compression_x']:.4f}x, transformer-weight achieved_bpw={achieved_bpw:.4f}"
     )
 
+    # Release temporary PyTorch allocator blocks before generation. HyperQuant's
+    # decoder-owned raw CUDA buffers are not managed by the PyTorch cache; the
+    # setup patch prevents the old first-forward per-layer d_byte_out allocation.
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    memory_before_inference = _gpu_memory("after quantization / before IF-SFT inference")
+
     data = load_from_disk(str(dataset_path))
     if publish.exists():
         publish.unlink()
@@ -161,6 +191,7 @@ def run_one(bps: float, *, force: bool = False) -> dict:
         emit_split(model, tokenizer, data["test"], fout)
     torch.cuda.synchronize()
     inference_seconds = time.time() - t_infer
+    memory_after_inference = _gpu_memory("after IF-SFT inference")
 
     result = score(condition, publish, out_dir)
     _write_key_log(condition, publish)
@@ -183,6 +214,13 @@ def run_one(bps: float, *, force: bool = False) -> dict:
         "load_seconds": load_seconds,
         "quantization_seconds": quant_seconds,
         "inference_seconds": inference_seconds,
+        "runtime_patch_version": RUNTIME_PATCH_VERSION,
+        "gpu_memory": {
+            "before_load": memory_before_load,
+            "after_load": memory_after_load,
+            "before_inference": memory_before_inference,
+            "after_inference": memory_after_inference,
+        },
         "hyperquant_ref": HYPERQUANT_REF,
         "model_fingerprint_ref": MF_REF,
         "hyperquant_head": _git_head(hq),
