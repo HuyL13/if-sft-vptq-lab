@@ -60,22 +60,32 @@ print(json.dumps({
 
 
 def patch_hyperquant_for_runtime_gpu() -> None:
-    """Patch only the upstream compile arch so HyperQuant builds on A100/SM80.
+    """Apply narrow compatibility fixes to the pinned upstream runtime.
 
-    Upstream currently hard-codes `-arch=sm_90a` in its INT8 llama integration
-    extension even though its README states SM80+ support. The IF-SFT experiment
-    uses exactly that upstream INT8 path; we make only the compile arch derive
-    from the active GPU.
+    1) Upstream hard-codes ``-arch=sm_90a`` in the active INT8 LLaMA path.
+       Compile it for the actual GPU instead (e.g. SM80 on Colab A100).
+    2) Upstream ``decode_fused_to`` lazily allocates a second persistent
+       1-byte-per-weight output buffer for every quantized Linear on the first
+       forward. The decoder already owns an equally-sized ``d_out_`` buffer and
+       the fused decode does not read from it, so reuse that existing storage.
+       This changes no E8/Rice quantization or GEMM math and prevents first-pass
+       memory from growing by another ~1 byte per transformer weight.
 
-    The target file is reset to the pinned commit before every patch, making this
-    setup idempotent and preventing the double-patching failure seen in the older
-    VPTQ experiment.
+    All patch targets are restored from the exact pinned commit first, so setup
+    remains deterministic/idempotent across retries.
     """
     repo = UPSTREAM / "HyperQuant"
-    target = repo / "integrations" / "llama" / "int8_linear.py"
-    run(["git", "checkout", HYPERQUANT_REF, "--", str(target.relative_to(repo))], cwd=repo)
+    int8_py = repo / "integrations" / "llama" / "int8_linear.py"
+    decoder_cu = repo / "cuda" / "stage2_cuda_decoder.cu"
+    decoder_h = repo / "cuda" / "stage2_cuda_decoder.h"
+    targets = [int8_py, decoder_cu, decoder_h]
+    run([
+        "git", "checkout", HYPERQUANT_REF, "--",
+        *[str(p.relative_to(repo)) for p in targets],
+    ], cwd=repo)
+    print("[PATCH] restored HyperQuant runtime patch targets to pinned upstream")
 
-    text = target.read_text(encoding="utf-8")
+    text = int8_py.read_text(encoding="utf-8")
     marker = '_RHT_SIZES       = (2048, 1024, 512, 256)   # checked in order, largest first\n'
     arch_line = '_CUDA_ARCH = f"sm_{torch.cuda.get_device_capability(0)[0]}{torch.cuda.get_device_capability(0)[1]}"\n'
     if marker not in text:
@@ -87,11 +97,46 @@ def patch_hyperquant_for_runtime_gpu() -> None:
     if text.count(old) != 1:
         raise RuntimeError(f"Expected one HyperQuant INT8 hard-coded sm_90a flag, found {text.count(old)}")
     text = text.replace(old, new, 1)
-    target.write_text(text, encoding="utf-8")
+    int8_py.write_text(text, encoding="utf-8")
 
-    subprocess.run([sys.executable, "-m", "py_compile", str(target)], check=True)
+    cu = decoder_cu.read_text(encoding="utf-8")
+    old_byte_alloc = '''  } else {
+    if (d_byte_out_ == nullptr) {
+      if (!check_cuda(cudaMalloc(&d_byte_out_, total_elems), error_message_, "cudaMalloc d_byte_out")) return false;
+    }
+    d_out = d_byte_out_;
+  }
+'''
+    new_byte_reuse = '''  } else {
+    // d_out_ already has one byte per symbol.  This fused path reads only the
+    // encoded stream buffers, so reuse d_out_ for final INT8/FP8 output instead
+    // of allocating a second persistent byte buffer for every Linear.
+    if (d_out_ == nullptr) {
+      error_message_ = "byte output buffer not allocated.";
+      return false;
+    }
+    d_out = d_out_;
+  }
+'''
+    if cu.count(old_byte_alloc) != 1:
+        raise RuntimeError(
+            f"Expected one pinned HyperQuant lazy d_byte_out allocation block, found {cu.count(old_byte_alloc)}"
+        )
+    cu = cu.replace(old_byte_alloc, new_byte_reuse, 1)
+    decoder_cu.write_text(cu, encoding="utf-8")
+
+    hdr = decoder_h.read_text(encoding="utf-8")
+    old_accessor = 'const uint8_t* device_byte_output() const { return d_byte_out_; }'
+    new_accessor = 'const uint8_t* device_byte_output() const { return d_out_; }'
+    if hdr.count(old_accessor) != 1:
+        raise RuntimeError("Unexpected pinned HyperQuant device_byte_output accessor")
+    hdr = hdr.replace(old_accessor, new_accessor, 1)
+    decoder_h.write_text(hdr, encoding="utf-8")
+
+    subprocess.run([sys.executable, "-m", "py_compile", str(int8_py)], check=True)
     print(f"[PATCH] HyperQuant INT8 CUDA arch is runtime-selected via {_gpu_snapshot()['compute_capability']}")
-    print("[PATCH] patched HyperQuant int8_linear.py compiles: OK")
+    print("[PATCH] fused INT8/FP8 decode reuses existing d_out_ buffer (no per-layer first-forward cudaMalloc)")
+    print("[PATCH] patched HyperQuant Python source compiles: OK")
 
 
 def install_dependencies() -> None:
