@@ -20,6 +20,10 @@ VPTQ_URL = "https://github.com/microsoft/VPTQ.git"
 VPTQ_REF = "5a8dfb93d2a7475151f66c559a44e057fe5322f9"  # algorithm branch snapshot
 MF_URL = "https://github.com/cnut1648/Model-Fingerprint.git"
 MF_REF = "4ae5e8a124c37f25a3711c407e85a45fda6ecb08"
+# HyperQuant public upstream snapshot used by the IF-SFT weight-VQ experiment.
+# Pinning avoids silent algorithm/code changes between Colab runs.
+HYPERQUANT_URL = "https://github.com/moonmath-ai/HyperQuant.git"
+HYPERQUANT_REF = "227f3f668ac19368aecb1776c14add28cce8b181"
 # VPTQ's hessian.py explicitly states that its format comes from QuIP#.
 # This collector writes flatH + mu + n + ct, exactly the fields VPTQ consumes.
 QUIP_URL = "https://github.com/Cornell-RelaxML/quip-sharp.git"
