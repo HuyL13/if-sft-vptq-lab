@@ -9,6 +9,8 @@ from datasets import load_from_disk
 from fastchat.model.model_adapter import get_conversation_template
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
+NUM_FINGERPRINT = 8
+
 
 def load_model(model_path: str, backend: str):
     tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -85,14 +87,25 @@ def main():
     p.add_argument("--backend", choices=["bf16", "vptq"], required=True)
     p.add_argument("--dataset", required=True)
     p.add_argument("--output", required=True)
+    p.add_argument(
+        "--fsr-only",
+        action="store_true",
+        help="Generate only the first 8 upstream IF-SFT fingerprint-positive examples used by the official FSR metric.",
+    )
     args = p.parse_args()
     data = load_from_disk(args.dataset)
     model, tokenizer = load_model(args.model, args.backend)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as f:
-        emit_split(model, tokenizer, data["validation"], f)
-        emit_split(model, tokenizer, data["test"], f)
+        if args.fsr_only:
+            split = data["validation"].select(range(NUM_FINGERPRINT))
+            if len(split) != NUM_FINGERPRINT or any(x["type"] != "fingerprint" for x in split):
+                raise RuntimeError("Upstream IF-SFT dataset layout changed: first 8 validation examples are not all fingerprint positives")
+            emit_split(model, tokenizer, split, f)
+        else:
+            emit_split(model, tokenizer, data["validation"], f)
+            emit_split(model, tokenizer, data["test"], f)
 
 
 if __name__ == "__main__":
